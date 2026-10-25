@@ -1,11 +1,12 @@
-#
+"""
 SenpaiX v5 — réseau social otaku, look "Otakun Mobile".
 Flask + Postgres (Render/Neon) ou SQLite (local). Sources : AniList + Jikan.
 Local :  pip install flask && python app.py        ->  http://localhost:5000
-Render : gunicorn app:app --workers 1 --threads 4 --timeout 60   (voir variables d'environnement ci-dessous)
-  DATABASE_URL    adresse Postgres (Neon)  -> données conservées entre les mises à jour
-  SECRET_KEY      longue chaîne aléatoire  -> sessions conservées entre les redémarrages
-  ADMIN_USERNAME / ADMIN_PASSWORD  compte administrateur (mot de passe >= 10 caractères)
+Render : fichier autonome — remplace simplement app.py, rien d'autre à modifier.
+  Seule variable utile : DATABASE_URL (adresse Postgres Neon) -> données conservées entre les mises à jour.
+  Facultatif : SECRET_KEY (sinon dérivée de DATABASE_URL), ADMIN_USERNAME / ADMIN_PASSWORD
+  (sinon crée l'administrateur sur la page /installation), SENPAIX_DEBUG=1 (détails dans /healthz?db=1).
+  Le pilote Postgres (psycopg2) s'installe tout seul s'il manque ; gunicorn n'est pas obligatoire.
 """
 import os, re, json, time, random, sqlite3, secrets, logging, threading
 import urllib.request, urllib.parse, urllib.error, ssl
@@ -45,9 +46,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("senpaix")
 
 
+_m = re.search(r"postgres(?:ql)?://[^\s'\"]+", os.environ.get("DATABASE_URL", ""))
+DATABASE_URL = _m.group(0).replace("postgres://", "postgresql://", 1) if _m else ""
+
+
 def secret():
     if os.environ.get("SECRET_KEY"):
         return os.environ["SECRET_KEY"]
+    if DATABASE_URL:      # stable entre les redémarrages et secrète (contient le mot de passe de la base)
+        import hashlib
+        return hashlib.sha256(("senpaix-session-v1|" + DATABASE_URL).encode()).hexdigest()
     if not os.path.exists(KEY_FILE):
         with open(KEY_FILE, "w") as f:
             f.write(secrets.token_hex(32))
@@ -55,7 +63,7 @@ def secret():
 
 
 PROD = bool(os.environ.get("RENDER")) or os.environ.get("SENPAIX_PROD") == "1"
-if PROD and not os.environ.get("SECRET_KEY"):
+if PROD and not os.environ.get("SECRET_KEY") and not DATABASE_URL:
     log.error("SECRET_KEY absente : les utilisateurs seront déconnectés à chaque redémarrage. Ajoute-la dans Render > Environment.")
 app = Flask(__name__)
 app.secret_key = secret()
@@ -100,10 +108,34 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip().replace("postgres://", "postgresql://", 1)
 PG = DATABASE_URL.startswith("postgresql")
+
+
+def install_psycopg2():
+    """Installe le pilote Postgres si requirements.txt ne le contient pas (aucun fichier à modifier)."""
+    import subprocess, sys, importlib
+    target = os.path.join(BASE, ".pylibs")
+    log.warning("psycopg2 absent : installation automatique (une seule fois par démarrage)…")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--default-timeout", "20",
+                           "--target", target, "psycopg2-binary"], timeout=50)
+    sys.path.insert(0, target)
+    importlib.invalidate_caches()
+
+
 if PG:
-    import psycopg2, psycopg2.extras
+    import sys
+    if os.path.isdir(os.path.join(BASE, ".pylibs")):
+        sys.path.insert(0, os.path.join(BASE, ".pylibs"))
+    try:
+        import psycopg2, psycopg2.extras
+    except ImportError:
+        try:
+            install_psycopg2()
+            import psycopg2, psycopg2.extras
+        except Exception:
+            log.exception("Impossible d'installer psycopg2 : retour au stockage temporaire SQLite")
+            PG = False
+if PG:
     DBError = psycopg2.Error
 else:
     DBError = sqlite3.Error
@@ -200,16 +232,13 @@ def init_db():
     con = Conn()
     try:
         if PG:
-            con.con.autocommit = True
             c = con.con.cursor()
-            c.execute("SELECT pg_advisory_lock(727001)")
-            try:
-                for st in [x.strip() for x in SCHEMA.replace("id INTEGER PRIMARY KEY", "id SERIAL PRIMARY KEY").replace("BLOB", "BYTEA").split(";") if x.strip()]:
-                    c.execute(st)
-                for t, col in MIGRATIONS:
-                    c.execute("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s" % (t, col))
-            finally:
-                c.execute("SELECT pg_advisory_unlock(727001)")
+            c.execute("SELECT pg_advisory_xact_lock(727001)")
+            for st in [x.strip() for x in SCHEMA.replace("id INTEGER PRIMARY KEY", "id SERIAL PRIMARY KEY").replace("BLOB", "BYTEA").split(";") if x.strip()]:
+                c.execute(st)
+            for t, col in MIGRATIONS:
+                c.execute("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s" % (t, col))
+            con.commit()
         else:
             con.con.executescript(SCHEMA)
             for t, col in MIGRATIONS:
@@ -231,12 +260,26 @@ def next_tournament():
 
 
 # ───────────────────────────── Helpers ─────────────────────────────
+def safe_rollback():
+    d = g.get("db")
+    if d:
+        try:
+            d.rollback()
+        except Exception:
+            pass
+
+
 def me():
     if "me" not in g:
         g.me = None
         uid = session.get("uid")
         if uid:
-            u = db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+            try:
+                u = db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+            except DBError:
+                log.exception("me() : base injoignable")
+                safe_rollback()
+                return g.me
             if u and u["sv"] == session.get("sv") and not u["banned"]:
                 g.me = u
             else:
@@ -266,12 +309,31 @@ def is_admin():
     return user_is_admin(me())
 
 
+ADM = {"yes": False, "t": 0.0}
+
+
+def admin_exists(fresh=False):
+    if ADM["yes"]:
+        return True
+    if not fresh and time.time() - ADM["t"] < 30:
+        return False
+    ADM["t"] = time.time()
+    try:
+        ADM["yes"] = bool(os.environ.get("SENPAIX_ADMINS")) or db().execute("SELECT 1 FROM users WHERE is_admin=1").fetchone() is not None
+    except DBError:
+        safe_rollback()
+        return True            # en cas de doute on masque l'installation
+    return ADM["yes"]
+
+
 def admin_only(fn):
     @wraps(fn)
     def w(*a, **k):
         if not me():
             return redirect("/connexion?next=" + urllib.parse.quote(request.path))
         if not is_admin():
+            if not admin_exists(True):
+                return redirect("/installation")
             abort(403)
         return fn(*a, **k)
     return w
@@ -330,6 +392,7 @@ def profs():
                           db().execute("SELECT username,av,p_ring,p_color FROM users WHERE av>0 OR p_ring!='none'").fetchall()}
         except Exception:
             log.exception("profs")
+            safe_rollback()
     return PROFS["d"]
 
 
@@ -376,9 +439,13 @@ def inject():
     u = me()
     unread = 0
     if u:
-        unread = db().execute("SELECT (SELECT COUNT(*) FROM notifs WHERE user_id=? AND read=0)+"
-                              "(SELECT COUNT(*) FROM msgs WHERE r=? AND read=0)", (u["id"], u["id"])).fetchone()[0]
-    return dict(durable=DURABLE, STATUSES=STATUSES, REASONS=REASONS, is_admin=is_admin(), me=u, ic=ic, ava=ava, ago=ago, unread=unread, path=request.path,
+        try:
+            unread = db().execute("SELECT (SELECT COUNT(*) FROM notifs WHERE user_id=? AND read=0)+"
+                                  "(SELECT COUNT(*) FROM msgs WHERE r=? AND read=0)", (u["id"], u["id"])).fetchone()[0]
+        except DBError:
+            log.exception("inject : compteur de notifications")
+            safe_rollback()
+    return dict(setup_open=bool(u) and not admin_exists(), durable=DURABLE, STATUSES=STATUSES, REASONS=REASONS, is_admin=is_admin(), me=u, ic=ic, ava=ava, ago=ago, unread=unread, path=request.path,
                 csrf=lambda: Markup(f'<input type="hidden" name="_csrf" value="{session.setdefault("csrf", secrets.token_hex(16))}">'))
 
 
@@ -1117,12 +1184,53 @@ def admin_export():
                               headers={"Content-Disposition": f"attachment; filename=senpaix-sauvegarde-{now()[:10]}.json"})
 
 
+@app.route("/installation", methods=["GET", "POST"])
+def setup():
+    if admin_exists(True):
+        abort(404)
+    f = request.form
+    if request.method == "POST":
+        n, p = txt(f.get("username"), 20), f.get("password", "")
+        d = db()
+        u = d.execute("SELECT * FROM users WHERE username=?", (n,)).fetchone()
+        if not throttle("setup" + str(request.remote_addr), 8, 600):
+            flash("Trop de tentatives, réessaie dans quelques minutes.", "err")
+        elif u:
+            if check_password_hash(u["pw"], p) and not u["banned"]:
+                d.execute("UPDATE users SET is_admin=1 WHERE id=?", (u["id"],))
+                ADM["yes"] = True
+                session.clear(); session.update(uid=u["id"], sv=u["sv"]); session.permanent = True
+                flash(f"{n} est maintenant administrateur.", "ok")
+                return redirect("/admin")
+            flash("Mot de passe incorrect pour ce pseudo.", "err")
+        elif not re.fullmatch(r"[\w.\-]{3,20}", n) or n.lower() == "modifier":
+            flash("Pseudo : 3-20 caractères (lettres, chiffres, . _ -).", "err")
+        elif len(p) < 10 or pw_problem(p, n):
+            flash(pw_problem(p, n) or "Mot de passe : 10 caractères minimum pour un administrateur.", "err")
+        elif p != f.get("password2"):
+            flash("Les deux mots de passe sont différents.", "err")
+        else:
+            i = d.execute("INSERT INTO users(username,pw,is_admin,recovery,created) VALUES(?,?,1,?,?)", (n, generate_password_hash(p), "", now())).lastrowid
+            ADM["yes"] = True
+            session.clear(); session.update(uid=i, sv=0); session.permanent = True
+            flash("Administrateur créé. Bienvenue !", "ok")
+            return redirect("/admin")
+    return render_template("setup.html", title="Installation", bare=True, v=f)
+
+
 @app.route("/healthz")
 def healthz():
-    if request.args.get("db"):
-        db().execute("SELECT 1").fetchone()
-        return "ok " + ("postgresql" if PG else "sqlite")
-    return "ok"
+    if not request.args.get("db"):
+        return "ok"
+    try:
+        n = db().execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        return f"ok {'postgresql' if PG else 'sqlite'} · {n} membre(s)" + ("" if READY["ok"] else f" · init en attente ({READY['err']})"), 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as e:
+        safe_rollback()
+        out = f"ERREUR base : {type(e).__name__}" + (f" [{e.pgcode}]" if getattr(e, "pgcode", None) else "") + (f"\ninit : {READY['err']}" if READY["err"] else "")
+        if os.environ.get("SENPAIX_DEBUG") == "1":
+            out += "\n" + mask(str(e))[:500]
+        return out, 503, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/robots.txt")
@@ -1228,7 +1336,9 @@ def secure(r):
 @app.errorhandler(500)
 def err500(e):
     log.exception("Erreur 500")
-    return render_template("err.html", title="Erreur", code=500), 500
+    safe_rollback()
+    kind = type(getattr(e, "original_exception", None) or e).__name__
+    return render_template("err.html", title="Erreur", code=500, msg=f"Erreur interne du serveur. Réessaie ; si le problème continue, préviens l'administrateur. ({kind})"), 500
 
 
 @app.errorhandler(404)
@@ -1236,6 +1346,13 @@ def err500(e):
 @app.errorhandler(400)
 def err(e):
     return render_template("err.html", title="Oups", code=e.code), e.code
+
+
+@app.errorhandler(DBError)
+def err_db(e):
+    log.exception("Erreur base de données")
+    safe_rollback()
+    return render_template("err.html", title="Indisponible", code=503, msg=f"La base de données ne répond pas pour le moment. Réessaie dans quelques secondes. ({type(e).__name__})"), 503, {"Retry-After": "5"}
 
 
 # ───────────────────────────── Style (thème Otakun : nuit + orange) ─────────────────────────────
@@ -1344,7 +1461,7 @@ T["base.html"] = r"""<!doctype html><html lang="fr" data-theme="{{ me.theme if m
 <a class="logo" href="/">Senpai<b>X</b></a><span class="sp"></span><a href="/recherche">{{ ic('search') }}</a>
 {% if me %}<a class="b" href="/notifications">{{ ic('bell') }}{% if unread %}<i>{{ unread }}</i>{% endif %}</a>{% endif %}
 <details class="menu"><summary>{{ ic('dots',24) }}</summary><div class="mn">{% if me %}<a href="/profil/{{ me.username }}">{{ ic('user',18) }} Mon profil</a><a href="/messages">{{ ic('msg',18) }} Messages</a><a href="/parametres">{{ ic('sliders',18) }} Paramètres</a>{% else %}<a href="/connexion">{{ ic('out',18) }} Connexion</a><a href="/inscription">{{ ic('user',18) }} Créer un compte</a>{% endif %}
-{% if me %}<a href="/liste">{{ ic('star',18) }} Ma liste</a>{% endif %}<a href="/catalogue">{{ ic('compass',18) }} Catalogue</a>{% if is_admin %}<a href="/admin">{{ ic('shield',18) }} Modération</a>{% endif %}<a href="#" onclick="installApp();return false">{{ ic('dl',18) }} Installer l'app</a><a href="/a-propos">{{ ic('info',18) }} À propos</a><a href="/confidentialite">{{ ic('lock',18) }} Confidentialité</a><a href="/conditions">{{ ic('shield',18) }} Conditions</a><a href="/diagnostic">{{ ic('sliders',18) }} Diagnostic</a>{% if me %}<form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button>{{ ic('out',18) }} Se déconnecter</button></form>{% endif %}</div></details></div></header>{% endif %}
+{% if me %}<a href="/liste">{{ ic('star',18) }} Ma liste</a>{% endif %}{% if setup_open %}<a href="/installation">{{ ic('shield',18) }} Devenir administrateur</a>{% endif %}<a href="/catalogue">{{ ic('compass',18) }} Catalogue</a>{% if is_admin %}<a href="/admin">{{ ic('shield',18) }} Modération</a>{% endif %}<a href="#" onclick="installApp();return false">{{ ic('dl',18) }} Installer l'app</a><a href="/a-propos">{{ ic('info',18) }} À propos</a><a href="/confidentialite">{{ ic('lock',18) }} Confidentialité</a><a href="/conditions">{{ ic('shield',18) }} Conditions</a><a href="/diagnostic">{{ ic('sliders',18) }} Diagnostic</a>{% if me %}<form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button>{{ ic('out',18) }} Se déconnecter</button></form>{% endif %}</div></details></div></header>{% endif %}
 <main>{% if is_admin and not durable %}<a class="flash err" href="/admin" style="display:block">⚠️ Stockage temporaire : les données seront effacées à la prochaine mise à jour. Touche ici pour voir comment corriger.</a>{% endif %}{% for c,m in get_flashed_messages(with_categories=true) %}<div class="flash {{ c }}">{{ m }}</div>{% endfor %}{% block c %}{% endblock %}</main>
 {% if not bare %}<nav class="tabs"><div>{% for h,i,l in [('/','home','Découverte'),('/communautes','users','Groupes'),('/quiz','game','Quiz'),('/catalogue','compass','Catalogue'),('/profil/'+me.username if me else '/connexion','user','Profil')] %}
 <a href="{{ h }}" class="{{ 'on' if (path==h or (h!='/' and path.startswith(h[:6]))) }} {{ 'mid' if i=='game' }}">{{ ic(i) }}{{ l }}</a>{% endfor %}</div></nav>{% endif %}<script>if('serviceWorker' in navigator)addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){})});var DP;addEventListener('beforeinstallprompt',function(e){e.preventDefault();DP=e});
@@ -1494,7 +1611,7 @@ T["settings.html"] = r"""{% extends "base.html" %}{% from "m.html" import item, 
 <div class="sec">Mes données</div><div class="grp"><form method="post" action="/export">{{ csrf() }}<button class="it"><span class="ico">{{ ic('dl',19) }}</span><span class="grow">Exporter mes données (JSON)</span></button></form></div>
 <div class="grp"><form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button class="it"><span class="ico">{{ ic('out',19) }}</span><span class="grow">Se déconnecter</span></button></form></div>
 <div class="sec" style="color:#ff6b81">Zone dangereuse</div><div class="grp" style="padding:12px 16px"><form method="post" onsubmit="return confirm('Supprimer définitivement ?')">{{ csrf() }}<input type="hidden" name="action" value="delete"><small class="mut">Irréversible. Tape ton pseudo et ton mot de passe.</small><input name="confirm" placeholder="Ton pseudo" style="margin:8px 0"><input type="password" name="password" placeholder="Mot de passe"><p><button class="btn s r">Supprimer mon compte</button></p></form></div>
-<p class="mut" style="text-align:center;font-size:.72rem">SenpaiX v4 · Jikan + AniList</p><span style="display:none">[span_0](start_span)[span_0](end_span)</span>{% endblock %}"""
+<p class="mut" style="text-align:center;font-size:.72rem">SenpaiX v4 · Jikan + AniList</p>{% endblock %}"""
 
 T["auth.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><div class="logo" style="font-size:2.6rem">Senpai<b>X</b></div><p class="mut" style="margin:4px 0 14px">L'univers Otaku autrement.</p>
 <div class="seg"><a class="{{ '' if reg else 'on' }}" href="/connexion">Connexion</a><a class="{{ 'on' if reg }}" href="/inscription">Inscription</a></div>
@@ -1634,7 +1751,13 @@ function up(kind,file,w,h,max){if(!file)return;$('um').textContent='Envoi en cou
   $('um').textContent='✅ Image enregistrée'}).catch(function(e){$('um').textContent='❌ '+e.message})}
 $('fa').onchange=function(){up('avatar',this.files[0],256,256,65000)};$('fb').onchange=function(){up('banner',this.files[0],900,300,160000)};</script>{% endblock %}"""
 
-T["err.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><h1 style="font-size:4rem;margin:0;color:var(--or)">{{ code }}</h1><p class="mut">Oups, cette page n'est pas disponible.</p><a class="btn" href="/">Retour à l'accueil</a></div>{% endblock %}"""
+T["setup.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><div class="logo" style="font-size:2.4rem">Senpai<b>X</b></div><h1 style="margin:8px 0">Installation</h1>
+<p class="mut">Aucun administrateur n'existe encore. Entre un pseudo et un mot de passe (10 caractères minimum). Si ce pseudo existe déjà, il devient administrateur après vérification de son mot de passe.</p>
+<form method="post" class="card">{{ csrf() }}<label>Pseudo</label><input name="username" required maxlength="20" autocapitalize="none" autocomplete="username" value="{{ v.get('username','') }}">
+<label>Mot de passe</label><input type="password" name="password" required autocomplete="new-password"><label>Confirmer <span style="font-weight:400">(nouveau compte seulement)</span></label><input type="password" name="password2" autocomplete="new-password">
+<p><button class="btn w">Devenir administrateur</button></p></form><p class="mut" style="font-size:.78rem">Cette page disparaît dès qu'un administrateur existe. Fais-le tout de suite après le déploiement.</p></div>{% endblock %}"""
+
+T["err.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><h1 style="font-size:4rem;margin:0;color:var(--or)">{{ code }}</h1><p class="mut">{{ msg or "Oups, cette page n'est pas disponible." }}</p><a class="btn" href="/">Retour à l'accueil</a></div>{% endblock %}"""
 
 app.jinja_loader = DictLoader(T)
 app.jinja_env.globals["css"] = CSS
@@ -1664,13 +1787,39 @@ def ensure_admin():
         con.close()
 
 
-try:
-    init_db()
-    if not DURABLE:
-        log.warning("⚠️ STOCKAGE TEMPORAIRE : DATABASE_URL absente, les données seront effacées à chaque mise à jour. Configure Postgres (Neon).")
-    ensure_admin()
-except Exception:
-    log.exception("Initialisation de la base impossible (vérifie DATABASE_URL)")
+READY = {"ok": False, "t": 0.0, "err": ""}
+BOOT_LOCK = threading.Lock()
+
+
+def mask(msg):
+    pw = urllib.parse.urlsplit(DATABASE_URL).password if PG else None
+    return msg.replace(pw, "***") if pw else msg
+
+
+def boot():
+    with BOOT_LOCK:
+        if READY["ok"]:
+            return
+        READY["t"] = time.time()
+        try:
+            init_db()
+            if not DURABLE:
+                log.warning("⚠️ STOCKAGE TEMPORAIRE : " + ("le pilote Postgres n'a pas pu être installé" if DATABASE_URL else "DATABASE_URL absente") + ", les données seront effacées à chaque mise à jour.")
+            ensure_admin()
+            READY.update(ok=True, err="")
+            log.info("Base prête (%s)", "PostgreSQL" if PG else "SQLite")
+        except Exception as e:
+            READY["err"] = type(e).__name__ + (f" [{e.pgcode}]" if getattr(e, "pgcode", None) else "")
+            log.error("Initialisation de la base impossible (%s). Vérifie DATABASE_URL. Détail : %s", READY["err"], mask(str(e))[:300])
+
+
+boot()
+
+
+@app.before_request
+def ensure_ready():
+    if not READY["ok"] and request.path != "/healthz" and time.time() - READY["t"] > 15:
+        boot()
 
 
 if __name__ == "__main__":
