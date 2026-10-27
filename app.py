@@ -8,12 +8,12 @@ Render : fichier autonome — remplace simplement app.py, rien d'autre à modifi
   (sinon crée l'administrateur sur la page /installation), SENPAIX_DEBUG=1 (détails dans /healthz?db=1).
   Le pilote Postgres (psycopg2) s'installe tout seul s'il manque ; gunicorn n'est pas obligatoire.
 """
-import os, re, json, time, random, sqlite3, secrets, logging, threading
+import os, io, re, json, time, random, sqlite3, secrets, logging, threading
 import urllib.request, urllib.parse, urllib.error, ssl
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from flask import (Flask, request, redirect, session, render_template, flash, abort, g,
-                   jsonify, url_for)
+                   jsonify, url_for, send_file)
 from jinja2 import DictLoader
 from markupsafe import Markup
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -71,7 +71,7 @@ if PROD:
     from werkzeug.middleware.proxy_fix import ProxyFix
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=PROD,
-                  PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 30, MAX_CONTENT_LENGTH=256 * 1024)
+                  PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 30, MAX_CONTENT_LENGTH=10 * 1024 * 1024)
 
 # ───────────────────────────── Base de données ─────────────────────────────
 SCHEMA = """
@@ -89,6 +89,10 @@ CREATE TABLE IF NOT EXISTS members(cid INTEGER REFERENCES communities(id) ON DEL
  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,PRIMARY KEY(cid,user_id));
 CREATE TABLE IF NOT EXISTS cposts(id INTEGER PRIMARY KEY,cid INTEGER REFERENCES communities(id) ON DELETE CASCADE,
  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,body TEXT NOT NULL,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cmedia(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES cposts(id) ON DELETE CASCADE,mime TEXT,data BLOB,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS creacts(pid INTEGER REFERENCES cposts(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,emo TEXT,PRIMARY KEY(pid,user_id));
+CREATE INDEX IF NOT EXISTS cmedia_pid ON cmedia(pid);
+CREATE INDEX IF NOT EXISTS cposts_cid ON cposts(cid,id);
 CREATE TABLE IF NOT EXISTS favs(user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,mal_id INTEGER,title TEXT,img TEXT,
  PRIMARY KEY(user_id,mal_id));
 CREATE TABLE IF NOT EXISTS scores(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -140,14 +144,14 @@ if PG:
 else:
     DBError = sqlite3.Error
 DURABLE = PG or not PROD      # sur Render sans Postgres, SQLite est effacé à chaque mise à jour
-ID_TABLES = {"users", "posts", "comments", "communities", "cposts", "scores", "notifs", "msgs", "reports", "admin_log"}
+ID_TABLES = {"users", "posts", "comments", "communities", "cposts", "cmedia", "scores", "notifs", "msgs", "reports", "admin_log"}
 FAV_UPSERT = (" ON CONFLICT (user_id,mal_id) DO UPDATE SET title=EXCLUDED.title,img=EXCLUDED.img,status=EXCLUDED.status,ep=EXCLUDED.ep,"
               "total=EXCLUDED.total,score=EXCLUDED.score,kind=EXCLUDED.kind,updated=EXCLUDED.updated")
 MIGRATIONS = (("users", "email TEXT DEFAULT ''"), ("users", "recovery TEXT DEFAULT ''"), ("users", "banned INTEGER DEFAULT 0"),
               ("users", "is_admin INTEGER DEFAULT 0"), ("users", "ban_reason TEXT DEFAULT ''"), ("users", "av INTEGER DEFAULT 0"), ("users", "bv INTEGER DEFAULT 0"),
               ("users", "p_ring TEXT DEFAULT 'none'"), ("users", "p_fx TEXT DEFAULT 'none'"), ("users", "p_name TEXT DEFAULT 'normal'"),
               ("users", "p_banner TEXT DEFAULT 'sunset'"), ("users", "p_color TEXT DEFAULT '#ff6a1a'"), ("users", "p_status TEXT DEFAULT ''"),
-              ("favs", "status TEXT DEFAULT 'voir'"), ("favs", "ep INTEGER DEFAULT 0"), ("favs", "total INTEGER DEFAULT 0"),
+              ("cposts", "mk TEXT DEFAULT ''"), ("favs", "status TEXT DEFAULT 'voir'"), ("favs", "ep INTEGER DEFAULT 0"), ("favs", "total INTEGER DEFAULT 0"),
               ("favs", "score INTEGER DEFAULT 0"), ("favs", "kind TEXT DEFAULT 'anime'"), ("favs", "updated TEXT DEFAULT ''"))
 
 
@@ -425,7 +429,11 @@ ICONS = {
     "info": "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 16v-4M12 8h.01",
     "out": "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9",
     "trash": "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6", "dl": "M21 15v4H3v-4M7 10l5 5 5-5M12 15V3",
-    "dots": "M12 5h.01M12 12h.01M12 19h.01", "send": "M22 2L11 13M22 2l-7 20-4-9-9-4z", "star": "M12 2l3 7 7 .6-5.3 4.8 1.6 7.4L12 18l-6.3 3.8 1.6-7.4L2 9.6 9 9z",
+    "dots": "M12 5h.01M12 12h.01M12 19h.01",
+    "image": "M3 5h18v14H3zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM21 15l-5-5L5 19",
+    "video": "M2 6h13v12H2zM15 10l7-4v12l-7-4",
+    "mic": "M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v1a7 7 0 0 1-14 0v-1M12 18v4M8 22h8",
+    "smile": "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01", "send": "M22 2L11 13M22 2l-7 20-4-9-9-4z", "star": "M12 2l3 7 7 .6-5.3 4.8 1.6 7.4L12 18l-6.3 3.8 1.6-7.4L2 9.6 9 9z",
 }
 
 
@@ -447,6 +455,14 @@ def inject():
             safe_rollback()
     return dict(setup_open=bool(u) and not admin_exists(), durable=DURABLE, STATUSES=STATUSES, REASONS=REASONS, is_admin=is_admin(), me=u, ic=ic, ava=ava, ago=ago, unread=unread, path=request.path,
                 csrf=lambda: Markup(f'<input type="hidden" name="_csrf" value="{session.setdefault("csrf", secrets.token_hex(16))}">'))
+
+
+@app.before_request
+def small_posts():
+    """Seuls les envois de médias de groupe peuvent dépasser 256 Ko."""
+    if request.method == "POST" and (request.content_length or 0) > 256 * 1024 \
+            and not (request.path.startswith("/api/groupe/") and request.path.endswith("/envoi")):
+        abort(413)
 
 
 @app.before_request
@@ -644,16 +660,71 @@ def communities():
             cid = d.execute("INSERT INTO communities(name,topic,descr,creator_id,created) VALUES(?,?,?,?,?)", (n, tp, ds, uid(), now())).lastrowid
             d.execute("INSERT INTO members VALUES(?,?)", (cid, uid()))
             return redirect(f"/communaute/{cid}")
-    rows = d.execute("SELECT c.*,(SELECT COUNT(*) FROM members WHERE cid=c.id) n,(SELECT COUNT(*) FROM members WHERE cid=c.id AND user_id=?) joined "
+    rows = d.execute("SELECT c.*,(SELECT COUNT(*) FROM members WHERE cid=c.id) n,(SELECT COUNT(*) FROM members WHERE cid=c.id AND user_id=?) joined,"
+                     "(SELECT MAX(created) FROM cposts WHERE cid=c.id) la "
                      "FROM communities c ORDER BY n DESC,c.id DESC", (uid(),)).fetchall()
     return render_template("communities.html", title="Communautés", rows=rows)
+
+
+REACTS = ["👍", "❤️", "😂", "😮", "😢", "🔥"]
+# Taille maximale (octets) par type d'envoi. Les médias sont stockés dans la base : garde-les raisonnables.
+MEDIA_MAX = {"image": 600_000, "gif": 1_500_000, "video": 8_000_000, "audio": 3_000_000}
+CMAX = 60
+
+
+def sniff(k, b):
+    """Reconnaît le vrai format d'après les premiers octets -> (mime, taille max) ou (None, 0)."""
+    if len(b) < 200:
+        return None, 0
+    mp4, webm = b[4:8] == b"ftyp", b[:4] == b"\x1a\x45\xdf\xa3"
+    if k == "image":
+        if b[:3] == b"\xff\xd8\xff":
+            return "image/jpeg", MEDIA_MAX["image"]
+        if b[:4] == b"GIF8":
+            return "image/gif", MEDIA_MAX["gif"]
+    elif k == "video":
+        if mp4:
+            return ("video/quicktime" if b[8:12] == b"qt  " else "video/mp4"), MEDIA_MAX["video"]
+        if webm:
+            return "video/webm", MEDIA_MAX["video"]
+    elif k == "audio":
+        if mp4:
+            return "audio/mp4", MEDIA_MAX["audio"]
+        if webm:
+            return "audio/webm", MEDIA_MAX["audio"]
+        if b[:4] == b"OggS":
+            return "audio/ogg", MEDIA_MAX["audio"]
+    return None, 0
+
+
+def cfeed(d, cid, after=0, before=0, limit=CMAX):
+    """Messages d'un groupe en ordre chronologique + réactions : (rows, plus_anciens, compteurs, ma_réaction)."""
+    sel = ("SELECT p.id,p.user_id,p.body,p.created,p.mk,u.username FROM cposts p JOIN users u ON u.id=p.user_id "
+           "WHERE p.cid=? AND p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id=?)")
+    more = False
+    if after:
+        rows = d.execute(sel + " AND p.id>? ORDER BY p.id LIMIT ?", (cid, uid(), after, limit)).fetchall()
+    else:
+        rows = d.execute(sel + (" AND p.id<?" if before else "") + " ORDER BY p.id DESC LIMIT ?",
+                         (cid, uid()) + ((before,) if before else ()) + (limit + 1,)).fetchall()
+        more, rows = len(rows) > limit, rows[:limit][::-1]
+    rc, rm = {}, {}
+    ids = [r["id"] for r in rows]
+    if ids:
+        ph = ",".join("?" * len(ids))
+        for r in d.execute(f"SELECT pid,emo,COUNT(*) n FROM creacts WHERE pid IN ({ph}) GROUP BY pid,emo ORDER BY n DESC,emo", tuple(ids)):
+            rc.setdefault(r["pid"], []).append((r["emo"], r["n"]))
+        if me():
+            for r in d.execute(f"SELECT pid,emo FROM creacts WHERE user_id=? AND pid IN ({ph})", (uid(),) + tuple(ids)):
+                rm[r["pid"]] = r["emo"]
+    return rows, more, rc, rm
 
 
 @app.route("/communaute/<int:cid>", methods=["GET", "POST"])
 def community(cid):
     d = db()
     c = d.execute("SELECT * FROM communities WHERE id=?", (cid,)).fetchone() or abort(404)
-    joined = me() and d.execute("SELECT 1 FROM members WHERE cid=? AND user_id=?", (cid, uid())).fetchone()
+    joined = bool(me() and d.execute("SELECT 1 FROM members WHERE cid=? AND user_id=?", (cid, uid())).fetchone())
     if request.method == "POST":
         if not me():
             return redirect("/connexion")
@@ -663,14 +734,99 @@ def community(cid):
                 d.execute("DELETE FROM members WHERE cid=? AND user_id=?", (cid, uid()))
             else:
                 d.execute("INSERT INTO members VALUES(?,?)", (cid, uid()))
-        elif a == "post" and joined and throttle(f"cp{uid()}", 8, 300):
+        elif a == "post" and joined and throttle(f"cp{uid()}", 30, 300):
             b = txt(request.form.get("body"), 800)
             if b:
-                d.execute("INSERT INTO cposts(cid,user_id,body,created) VALUES(?,?,?,?)", (cid, uid(), b, now()))
+                d.execute("INSERT INTO cposts(cid,user_id,body,created,mk) VALUES(?,?,?,?,?)", (cid, uid(), b, now(), ""))
         return redirect(f"/communaute/{cid}")
-    posts = d.execute("SELECT p.*,u.username FROM cposts p JOIN users u ON u.id=p.user_id WHERE cid=? AND p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id=?) ORDER BY p.id DESC LIMIT 50", (cid, uid())).fetchall()
+    posts, more, rc, rm = cfeed(d, cid)
     mem = d.execute("SELECT u.username FROM members m JOIN users u ON u.id=m.user_id WHERE cid=? LIMIT 12", (cid,)).fetchall()
-    return render_template("community.html", title=c["name"], c=c, joined=joined, posts=posts, mem=mem)
+    nmem = d.execute("SELECT COUNT(*) FROM members WHERE cid=?", (cid,)).fetchone()[0]
+    return render_template("community.html", title=c["name"], c=c, joined=joined, posts=posts, more=more, rc=rc, rm=rm, mem=mem,
+                           nmem=nmem, last=posts[-1]["id"] if posts else 0, first=posts[0]["id"] if posts else 0)
+
+
+@app.route("/api/groupe/<int:cid>/fil")
+def api_gfeed(cid):
+    d = db()
+    d.execute("SELECT 1 FROM communities WHERE id=?", (cid,)).fetchone() or abort(404)
+    big = 10 ** 12
+    rows, more, rc, rm = cfeed(d, cid, after=toint(request.args.get("apres"), 0, 0, big), before=toint(request.args.get("avant"), 0, 0, big))
+    joined = bool(me() and d.execute("SELECT 1 FROM members WHERE cid=? AND user_id=?", (cid, uid())).fetchone())
+    resp = jsonify(html=render_template("cfeed.html", posts=rows, rc=rc, rm=rm, joined=joined), n=len(rows), more=more,
+                   first=rows[0]["id"] if rows else 0, last=rows[-1]["id"] if rows else 0)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/groupe/<int:cid>/envoi", methods=["POST"])
+def api_gsend(cid):
+    """Envoi d'un message de groupe : texte, photo, GIF, vidéo ou message vocal (corps brut de la requête)."""
+    if not me():
+        return jsonify(error="Connecte-toi d'abord."), 401
+    d = db()
+    d.execute("SELECT 1 FROM communities WHERE id=?", (cid,)).fetchone() or abort(404)
+    if not d.execute("SELECT 1 FROM members WHERE cid=? AND user_id=?", (cid, uid())).fetchone():
+        return jsonify(error="Rejoins le groupe pour écrire."), 403
+    k = request.args.get("k", "texte")
+    if k not in ("texte", "image", "video", "audio"):
+        return jsonify(error="Type d'envoi inconnu."), 400
+    limit = 4000 if k == "texte" else max(MEDIA_MAX["gif"], MEDIA_MAX["image"]) if k == "image" else MEDIA_MAX[k]
+    if (request.content_length or 0) > limit:
+        return jsonify(error="Fichier trop lourd."), 413
+    data = request.get_data(cache=False)
+    if len(data) > limit:
+        return jsonify(error="Fichier trop lourd."), 413
+    if k == "texte":
+        body = txt(data.decode("utf-8", "ignore"), 800)
+        if not body:
+            return jsonify(error="Message vide."), 400
+        if not throttle(f"cp{uid()}", 30, 300):
+            return jsonify(error="Doucement ! Réessaie dans un instant."), 429
+        pid = d.execute("INSERT INTO cposts(cid,user_id,body,created,mk) VALUES(?,?,?,?,?)", (cid, uid(), body, now(), "")).lastrowid
+        return jsonify(ok=True, id=pid)
+    mime, cap = sniff(k, data)
+    if not mime:
+        return jsonify(error="Format non pris en charge."), 400
+    if len(data) > cap:
+        return jsonify(error="Fichier trop lourd (max %s Mo)." % round(cap / 1e6, 1)), 413
+    if not throttle(f"gm{uid()}", 12, 600) or (k == "video" and not throttle(f"gv{uid()}", 6, 3600)):
+        return jsonify(error="Trop d'envois, réessaie un peu plus tard."), 429
+    pid = d.execute("INSERT INTO cposts(cid,user_id,body,created,mk) VALUES(?,?,?,?,?)", (cid, uid(), txt(request.args.get("t"), 300), now(), k)).lastrowid
+    d.execute("INSERT INTO cmedia(pid,mime,data,created) VALUES(?,?,?,?)", (pid, mime, data, now()))
+    return jsonify(ok=True, id=pid)
+
+
+@app.route("/api/groupe/media/<int:pid>")
+def gmedia(pid):
+    r = db().execute("SELECT mime,data FROM cmedia WHERE pid=?", (pid,)).fetchone() or abort(404)
+    raw = bytes(r["data"])
+    resp = send_file(io.BytesIO(raw), mimetype=r["mime"], conditional=True, etag=f"gm{pid}-{len(raw)}")   # conditional = lecture vidéo/audio par morceaux
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
+@app.route("/api/groupe/reagir/<int:pid>", methods=["POST"])
+def api_react(pid):
+    if not me():
+        return jsonify(error="Connecte-toi d'abord."), 401
+    d = db()
+    p = d.execute("SELECT cid FROM cposts WHERE id=?", (pid,)).fetchone() or abort(404)
+    if not d.execute("SELECT 1 FROM members WHERE cid=? AND user_id=?", (p["cid"], uid())).fetchone():
+        return jsonify(error="Rejoins le groupe pour réagir."), 403
+    e = (request.get_json(silent=True) or {}).get("e")
+    if e not in REACTS:
+        return jsonify(error="Réaction inconnue."), 400
+    if not throttle(f"rx{uid()}", 60, 300):
+        return jsonify(error="Doucement !"), 429
+    cur = d.execute("SELECT emo FROM creacts WHERE pid=? AND user_id=?", (pid, uid())).fetchone()
+    d.execute("DELETE FROM creacts WHERE pid=? AND user_id=?", (pid, uid()))
+    same = bool(cur and cur["emo"] == e)
+    if not same:
+        d.execute("INSERT INTO creacts(pid,user_id,emo) VALUES(?,?,?)", (pid, uid(), e))
+    counts = [(r["emo"], r["n"]) for r in d.execute("SELECT emo,COUNT(*) n FROM creacts WHERE pid=? GROUP BY emo ORDER BY n DESC,emo", (pid,))]
+    return jsonify(ok=True, html=render_template("crx.html", pid=pid, counts=counts, mine="" if same else e))
 
 
 # ───────────────────────────── Quiz & tournoi ─────────────────────────────
@@ -1055,6 +1211,10 @@ def target_info(kind, i):
     else:
         tb = {"post": "posts", "comment": "comments", "cpost": "cposts"}[kind]
         r = d.execute(f"SELECT t.user_id uid,u.username,t.body FROM {tb} t JOIN users u ON u.id=t.user_id WHERE t.id=?", (i,)).fetchone()
+    if r and kind == "cpost":
+        mk = d.execute("SELECT mk FROM cposts WHERE id=?", (i,)).fetchone()
+        if mk and mk["mk"]:
+            r = dict(uid=r["uid"], username=r["username"], body=f"[{mk['mk']} : /api/groupe/media/{i}] " + (r["body"] or ""))
     return r
 
 
@@ -1107,8 +1267,8 @@ def admin_user(i):
 @admin_only
 def admin_content():
     d = db()
-    get = lambda tb: d.execute(f"SELECT t.id,t.body,t.created,u.id uid,u.username FROM {tb} t JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 30").fetchall()
-    return render_template("admin_content.html", title="Contenus", tab="content", posts=get("posts"), comments=get("comments"), cposts=get("cposts"))
+    get = lambda tb, x="": d.execute(f"SELECT t.id,t.body,t.created{x},u.id uid,u.username FROM {tb} t JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 30").fetchall()
+    return render_template("admin_content.html", title="Contenus", tab="content", posts=get("posts"), comments=get("comments"), cposts=get("cposts", ",t.mk"))
 
 
 @app.route("/admin/action", methods=["POST"])
@@ -1438,6 +1598,35 @@ html[data-theme=light] .pill.on{background:#14182b;color:#fff}
 .chk{display:flex;gap:10px;align-items:flex-start;color:var(--text);font-size:.85rem;font-weight:500;margin:10px 0}.chk input{width:auto;margin-top:3px;accent-color:var(--or)}
 .hint{display:block;color:var(--mut);font-size:.74rem;margin-top:4px;min-height:1em}.pw{position:relative}.pw input{padding-right:74px}.eye{position:absolute;right:6px;top:6px;padding:7px 12px;font-size:.75rem;background:var(--card2);color:var(--text)}
 .meter{height:5px;background:var(--card2);border-radius:9px;margin-top:8px;overflow:hidden}.meter i{display:block;height:100%;width:0;transition:.25s}
+.ghd{display:flex;align-items:center;gap:12px;margin:4px 0 6px}
+.cm{display:flex;align-items:flex-end;gap:8px;margin:10px 0}.cm.mine{flex-direction:row-reverse}
+.cb{max-width:min(84%,420px);min-width:0;background:var(--card2);border-radius:18px 18px 18px 6px;padding:8px 12px 6px;position:relative}
+.cm.mine .cb{background:linear-gradient(100deg,var(--or),var(--or2));color:#fff;border-radius:18px 18px 6px 18px}
+.cn{display:block;font-weight:800;font-size:.78rem;color:var(--or2);margin-bottom:2px}
+.cb p{margin:2px 0 4px;white-space:pre-wrap;word-break:break-word}
+.cimg{display:block;max-width:100%;max-height:340px;min-width:160px;min-height:100px;border-radius:12px;margin:2px 0 6px;background:var(--card);object-fit:contain;cursor:zoom-in}
+.cvid{display:block;width:min(66vw,320px);max-height:380px;border-radius:12px;margin:2px 0 6px;background:#000}
+.caud{display:block;width:min(64vw,250px);height:40px;margin:2px 0 4px}
+.cf{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.cf small{font-size:.68rem;opacity:.75}
+.rx{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-left:auto}
+.rch{padding:2px 8px;border-radius:99px;background:#0003;color:inherit;font:600 .74rem inherit;font-family:inherit;gap:4px}.rch b{font-weight:700}
+.rch.on{outline:1.5px solid var(--or2);background:#ff6a1a33}.rch.bump{animation:bump .35s}@keyframes bump{40%{transform:scale(1.35)}}
+.rpk{position:relative}.rpk summary{list-style:none;cursor:pointer;display:flex;padding:2px;opacity:.7}.rpk summary::-webkit-details-marker{display:none}
+.rrow{position:absolute;bottom:28px;left:-8px;display:flex;gap:2px;background:var(--card);border:1px solid var(--line);border-radius:99px;padding:4px 6px;box-shadow:0 8px 28px #000a;z-index:5}
+.cm.mine .rrow{left:auto;right:-8px}.rrow button{background:none;padding:4px 5px;font-size:1.2rem;border-radius:50%;color:inherit}
+.cmore summary{opacity:.7;color:inherit}.cmn{top:auto;bottom:26px;right:0;color:var(--text)}
+.pop{animation:pop .35s cubic-bezier(.2,1.4,.4,1)}@keyframes pop{from{opacity:0;transform:translateY(14px) scale(.96)}}
+.cbar{position:fixed;left:0;right:0;bottom:0;z-index:40;background:color-mix(in srgb,var(--bg) 94%,transparent);backdrop-filter:blur(14px);border-top:1px solid var(--line);padding:8px 0 calc(8px + env(safe-area-inset-bottom))}
+.cbar>div{max-width:640px;margin:auto;padding:0 12px}.crow{display:flex;align-items:flex-end;gap:4px}
+.crow textarea{min-height:42px;max-height:120px;height:42px;resize:none;border-radius:22px;padding:10px 14px;margin:0}
+.cbar .ib{background:none;color:var(--mut);padding:9px;border-radius:50%;margin:0;cursor:pointer;display:inline-flex;flex:none}.cbar .ib:active{background:var(--card2)}
+.cbar .send{padding:0;width:42px;height:42px;flex:none}.cbar .send:disabled{opacity:.5}
+.tray{display:flex;align-items:center;gap:10px;background:var(--card2);border-radius:16px;padding:8px;margin-bottom:8px;position:relative;overflow:hidden}
+.tp img,.tp video{width:56px;height:56px;border-radius:10px;object-fit:cover;display:block}.tp audio{height:36px;width:190px}
+.pbar{position:absolute;left:0;right:0;bottom:0;height:3px}.pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--or),var(--or2));transition:width .15s}
+.rec{display:flex;align-items:center;gap:10px;padding:4px 2px}.rec .dot{width:12px;height:12px;border-radius:50%;background:var(--red);animation:pulse 1s infinite}
+.cbar [hidden]{display:none!important}
+.zoom{position:fixed;inset:0;z-index:100;background:#000e;display:flex;align-items:center;justify-content:center;padding:10px}.zoom img{max-width:100%;max-height:100%;border-radius:8px}
 """
 
 # ───────────────────────────── Templates ─────────────────────────────
@@ -1536,15 +1725,96 @@ T["post.html"] = r"""{% extends "base.html" %}{% from "m.html" import post, flag
 {% if me %}<form method="post" class="row" style="margin-top:12px">{{ csrf() }}<input name="body" maxlength="500" placeholder="Ajouter un commentaire…" required><button class="btn">{{ ic('send',18) }}</button></form>{% endif %}{% endblock %}"""
 
 T["communities.html"] = r"""{% extends "base.html" %}{% block c %}<div class="hero" style="font-size:1.7rem">Rencontre des groupes de<em style="font-size:2rem">passionnés !</em></div>
-{% for c in rows %}<a class="card row" href="/communaute/{{ c.id }}"><span class="ava" style="width:46px;height:46px;background:linear-gradient(135deg,var(--or),#ff3d71);font-size:1.2rem">{{ c.name[:1]|upper }}</span><div class="grow"><b>{{ c.name }}</b><small class="mut" style="display:block">{{ c.topic }} · {{ c.n }} membre{{ 's' if c.n>1 }}</small></div>{% if c.joined %}<small style="color:var(--or)">Membre</small>{% endif %}</a>
+{% for c in rows %}<a class="card row" href="/communaute/{{ c.id }}"><span class="ava" style="width:46px;height:46px;background:linear-gradient(135deg,var(--or),#ff3d71);font-size:1.2rem">{{ c.name[:1]|upper }}</span><div class="grow"><b>{{ c.name }}</b><small class="mut" style="display:block">{{ c.topic }} · {{ c.n }} membre{{ 's' if c.n>1 }}{% if c.la %} · 💬 {{ ago(c.la) }}{% endif %}</small></div>{% if c.joined %}<small style="color:var(--or)">Membre</small>{% endif %}</a>
 {% else %}<p class="mut" style="text-align:center">Aucun groupe. Crée le premier !</p>{% endfor %}
 {% if me %}<h2>Créer un groupe</h2><form method="post" class="card">{{ csrf() }}<label>Nom</label><input name="name" maxlength="40" required><label>Thème (ex : One Piece)</label><input name="topic" maxlength="40"><label>Description</label><textarea name="descr" maxlength="300"></textarea><p><button class="btn w">Créer</button></p></form>{% endif %}{% endblock %}"""
 
-T["community.html"] = r"""{% extends "base.html" %}{% from "m.html" import flag with context %}{% block c %}<h1>{{ c.name }}</h1><p class="mut">{{ c.topic }} — {{ c.descr }}</p>
-<div class="row" style="margin-bottom:8px">{% for m in mem %}<a href="/profil/{{ m.username }}">{{ ava(m.username,34) }}</a>{% endfor %}</div>
-{% if me %}<form method="post">{{ csrf() }}<input type="hidden" name="action" value="join"><button class="btn {{ 'g' if joined }} w">{{ 'Quitter le groupe' if joined else 'Rejoindre' }}</button></form>{% endif %}
-{% if joined %}<form method="post" class="card">{{ csrf() }}<input type="hidden" name="action" value="post"><textarea name="body" maxlength="800" placeholder="Écris au groupe…" style="min-height:56px"></textarea><div style="text-align:right;margin-top:8px"><button class="btn s">Envoyer</button></div></form>{% endif %}
-{% for p in posts %}<div class="post"><div class="ph">{{ ava(p.username,34) }}<div class="grow"><b>{{ p.username }}</b><small>{{ ago(p.created) }}</small></div>{% if me and me.id==p.user_id %}<form method="post" action="/supprimer/cpost/{{ p.id }}">{{ csrf() }}<button class="btn g s">{{ ic('trash',14) }}</button></form>{% else %}{{ flag('cpost',p.id,p.username) }}{% endif %}</div><p>{{ p.body }}</p></div>{% endfor %}{% endblock %}"""
+T["c.html"] = r"""{% macro rxbar(pid, counts, mine, joined) %}{% for e,n in counts %}<button type="button" class="rch{{ ' on' if e==mine }}" {% if joined %}onclick="react({{ pid }},'{{ e }}')"{% else %}disabled{% endif %}>{{ e }} <b>{{ n }}</b></button>{% endfor %}{% if joined %}<details class="rpk"><summary>{{ ic('smile',16) }}</summary><div class="rrow">{% for e in REACTS %}<button type="button" onclick="react({{ pid }},'{{ e }}')">{{ e }}</button>{% endfor %}</div></details>{% endif %}{% endmacro %}
+{% macro cmsg(p, rc, rm, joined) %}{% set mine = me and me.id==p.user_id %}{% set src = '/api/groupe/media/' ~ p.id ~ '?v=' ~ (p.created|replace('-','')|replace(' ','')|replace(':','')) %}
+<div class="cm{{ ' mine' if mine }}" id="m{{ p.id }}" data-id="{{ p.id }}">{% if not mine %}<a href="/profil/{{ p.username }}">{{ ava(p.username,32) }}</a>{% endif %}<div class="cb">{% if not mine %}<a class="cn" href="/profil/{{ p.username }}">{{ p.username }}</a>{% endif %}
+{% if p.mk=='image' %}<img class="cimg" src="{{ src }}" alt="Photo" loading="lazy" onclick="zoom(this.src)">{% elif p.mk=='video' %}<video class="cvid" src="{{ src }}#t=0.1" controls playsinline preload="metadata"></video>{% elif p.mk=='audio' %}<audio class="caud" src="{{ src }}" controls preload="none"></audio>{% endif %}
+{% if p.body %}<p>{{ p.body }}</p>{% endif %}
+<div class="cf"><small>{{ ago(p.created) }}</small><div class="rx" id="rx{{ p.id }}">{{ rxbar(p.id, rc.get(p.id,[]), rm.get(p.id,''), joined) }}</div>
+{% if me %}<details class="more cmore"><summary>{{ ic('dots',16) }}</summary><div class="mn cmn">{% if mine %}<form method="post" action="/supprimer/cpost/{{ p.id }}" onsubmit="return confirm('Supprimer ce message ?')">{{ csrf() }}<button>{{ ic('trash',18) }} Supprimer</button></form>{% else %}<form method="post" action="/signaler/cpost/{{ p.id }}">{{ csrf() }}<select name="reason" style="margin-bottom:6px">{% for r in REASONS %}<option>{{ r }}</option>{% endfor %}</select><button>{{ ic('shield',18) }} Signaler</button></form><form method="post" action="/bloquer/{{ p.username }}">{{ csrf() }}<button>{{ ic('lock',18) }} Bloquer {{ p.username }}</button></form>{% endif %}</div></details>{% endif %}</div></div></div>{% endmacro %}"""
+T["cfeed.html"] = r"""{% from "c.html" import cmsg with context %}{% for p in posts %}{{ cmsg(p, rc, rm, joined) }}{% endfor %}"""
+T["crx.html"] = r"""{% from "c.html" import rxbar with context %}{{ rxbar(pid, counts, mine, True) }}"""
+
+T["community.html"] = r"""{% extends "base.html" %}{% set back='/communautes' %}{% block c %}
+{% if joined %}<style>.tabs{display:none}</style>{% endif %}
+<div class="ghd"><span class="ava" style="width:52px;height:52px;background:linear-gradient(135deg,var(--or),#ff3d71);font-size:1.4rem">{{ c.name[:1]|upper }}</span><div class="grow"><h1 style="margin:0;font-size:1.25rem">{{ c.name }}</h1><small class="mut">{% if c.topic %}{{ c.topic }} · {% endif %}{{ nmem }} membre{{ 's' if nmem>1 }}</small></div>
+{% if joined %}<details class="more"><summary>{{ ic('dots',22) }}</summary><div class="mn"><form method="post">{{ csrf() }}<input type="hidden" name="action" value="join"><button onclick="return confirm('Quitter le groupe ?')">{{ ic('out',18) }} Quitter le groupe</button></form></div></details>{% endif %}</div>
+{% if c.descr %}<p class="mut" style="margin:6px 0 10px">{{ c.descr }}</p>{% endif %}
+<div class="row" style="margin-bottom:10px">{% for m in mem %}<a href="/profil/{{ m.username }}">{{ ava(m.username,30) }}</a>{% endfor %}</div>
+{% if me and not joined %}<form method="post">{{ csrf() }}<input type="hidden" name="action" value="join"><button class="btn w">Rejoindre pour écrire, envoyer photos et vidéos</button></form>
+{% elif not me %}<a class="btn w" href="/connexion?next=/communaute/{{ c.id }}">Connecte-toi pour participer</a>{% endif %}
+{% if more %}<p style="text-align:center"><button type="button" class="btn g s" id="older">Messages plus anciens</button></p>{% endif %}
+<div id="msgs">{% include "cfeed.html" %}</div>
+<p id="empty" class="mut" style="text-align:center;margin:30px 0" {% if posts %}hidden{% endif %}>Aucun message pour le moment. Lance la conversation !</p>
+{% if joined %}<div class="cbar" id="cbar"><div>
+<div id="cerr" class="flash err" hidden></div><div id="tray" class="tray" hidden></div>
+<div id="rec" class="rec" hidden><i class="dot"></i><b id="rect">0:00</b><span class="grow mut">Enregistrement…</span><button type="button" class="btn g s" id="recx">Annuler</button><button type="button" class="btn s" id="recok">{{ ic('send',16) }} Envoyer</button></div>
+<form id="cf" method="post" class="crow">{{ csrf() }}<input type="hidden" name="action" value="post">
+<label class="ib" title="Photo">{{ ic('image',22) }}<input type="file" id="fimg" accept="image/*" hidden></label>
+<label class="ib" title="Vidéo">{{ ic('video',22) }}<input type="file" id="fvid" accept="video/*" hidden></label>
+<button type="button" class="ib" id="mic" title="Message vocal" hidden>{{ ic('mic',22) }}</button>
+<textarea name="body" id="cbody" rows="1" maxlength="800" placeholder="Écris au groupe…"></textarea>
+<button class="send" id="csend" aria-label="Envoyer">{{ ic('send',20) }}</button></form></div></div>
+<script>(function(){
+var CID={{ c.id }},csrf="{{ session.get('csrf','') }}",feed=$('msgs'),last={{ last }},first={{ first }},busy=false,pend=null,rec=null,VMAX={{ MEDIA_MAX.video }};
+function mo(n){return n<1e6?Math.max(1,Math.round(n/1000))+' Ko':(n/1e6).toFixed(1).replace('.0','')+' Mo'}
+function near(){return window.innerHeight+window.scrollY>=document.documentElement.scrollHeight-180}
+function down(sm){window.scrollTo({top:document.documentElement.scrollHeight,behavior:sm?'smooth':'auto'})}
+function pad(){document.body.style.paddingBottom=($('cbar').offsetHeight+14)+'px'}
+function err(m){var e=$('cerr');e.textContent=m;e.hidden=false;clearTimeout(err.t);err.t=setTimeout(function(){e.hidden=true},6000);pad()}
+function put(html,top){var t=document.createElement('div');t.innerHTML=html;var l=[].slice.call(t.children);
+ if(top){l.reverse().forEach(function(n){feed.insertBefore(n,feed.firstChild)})}else l.forEach(function(n){n.classList.add('pop');feed.appendChild(n)})}
+function poll(){if(document.hidden||busy)return;fetch('/api/groupe/'+CID+'/fil?apres='+last,{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){
+ if(!d.n||d.last<=last)return;var st=near();$('empty').hidden=true;put(d.html);last=d.last;if(st)down(true)}).catch(function(){})}
+setInterval(poll,5000);document.addEventListener('visibilitychange',function(){if(!document.hidden)poll()});
+function xhr(u,body,type,onp){return new Promise(function(res,rej){var x=new XMLHttpRequest();x.open('POST',u);x.setRequestHeader('Content-Type',type);x.setRequestHeader('X-CSRF',csrf);
+ if(x.upload&&onp)x.upload.onprogress=function(e){if(e.lengthComputable)onp(e.loaded/e.total)};
+ x.onload=function(){var d={};try{d=JSON.parse(x.responseText)}catch(e){}if(x.status>=200&&x.status<300&&d.ok)res(d);else rej(new Error(d.error||(x.status==413?'Fichier trop lourd.':'Envoi impossible ('+x.status+').')))};
+ x.onerror=function(){rej(new Error('Connexion impossible.'))};x.send(body)})}
+function lock(v){busy=v;$('csend').disabled=v}
+function prog(f){var p=$('pg');if(p)p.style.width=Math.round(f*100)+'%'}
+function clr(){if(pend&&pend.url)URL.revokeObjectURL(pend.url);pend=null;$('tray').hidden=true;$('tray').innerHTML='';$('cbody').placeholder='Écris au groupe…';pad()}
+function setPend(p){clr();pend=p;p.url=URL.createObjectURL(p.blob);var el=$('tray'),lb={image:'Photo',video:'Vidéo',audio:'Message vocal'}[p.kind]+' · '+mo(p.blob.size);
+ el.innerHTML='<div class="tp">'+(p.kind=='image'?'<img src="'+p.url+'" alt="">':p.kind=='video'?'<video src="'+p.url+'#t=0.1" muted playsinline></video>':'<audio src="'+p.url+'" controls></audio>')+'</div><div class="grow mut" style="font-size:.8rem">'+lb+'</div><button type="button" class="ib" id="tx" aria-label="Retirer">✕</button><div class="pbar"><i id="pg"></i></div>';
+ el.hidden=false;$('tx').onclick=clr;$('cbody').placeholder='Légende…';pad();down(false);if(p.kind!='audio')$('cbody').focus()}
+function done(){lock(false);clr();var b=$('cbody');b.value='';b.style.height='42px';poll();setTimeout(function(){down(true)},250)}
+function fail(e){lock(false);prog(0);err(e.message)}
+function send(){if(busy)return;var t=$('cbody').value.trim();
+ if(pend){lock(true);prog(0);return xhr('/api/groupe/'+CID+'/envoi?k='+pend.kind+(t?'&t='+encodeURIComponent(t.slice(0,300)):''),pend.blob,pend.mime,prog).then(done,fail)}
+ if(!t)return;lock(true);xhr('/api/groupe/'+CID+'/envoi?k=texte',t,'text/plain;charset=utf-8').then(done,fail)}
+$('cf').addEventListener('submit',function(e){e.preventDefault();send()});
+$('cbody').addEventListener('input',function(){this.style.height='42px';this.style.height=Math.min(this.scrollHeight,120)+'px';pad()});
+$('cbody').addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey&&!matchMedia('(pointer:coarse)').matches){e.preventDefault();send()}});
+function fit(file,max,lim){return new Promise(function(res,rej){var u=URL.createObjectURL(file),im=new Image();im.onerror=function(){URL.revokeObjectURL(u);rej(new Error('Image illisible.'))};
+ im.onload=function(){URL.revokeObjectURL(u);var r=Math.min(1,max/Math.max(im.width,im.height)),w=Math.round(im.width*r),h=Math.round(im.height*r),c=document.createElement('canvas');c.width=w;c.height=h;var x=c.getContext('2d');x.fillStyle='#000';x.fillRect(0,0,w,h);x.drawImage(im,0,0,w,h);
+  (function t(q){c.toBlob(function(b){if(!b)return rej(new Error('Conversion impossible.'));if(b.size>lim&&q>.4)return t(q-.1);b.size>lim?rej(new Error('Image trop lourde.')):res(b)},'image/jpeg',q)})(.85)};im.src=u})}
+$('fimg').onchange=function(){var f=this.files[0];this.value='';if(!f)return;
+ if(f.type==='image/gif'&&f.size<={{ MEDIA_MAX.gif }})return setPend({kind:'image',blob:f,mime:'image/gif'});
+ fit(f,1280,560000).then(function(b){setPend({kind:'image',blob:b,mime:'image/jpeg'})},function(e){err(e.message)})};
+$('fvid').onchange=function(){var f=this.files[0];this.value='';if(!f)return;
+ if(f.size>VMAX)return err('Vidéo trop lourde ('+mo(f.size)+'). Maximum '+mo(VMAX)+' : choisis un clip plus court.');
+ setPend({kind:'video',blob:f,mime:f.type||'video/mp4'})};
+if(window.MediaRecorder&&navigator.mediaDevices&&navigator.mediaDevices.getUserMedia)$('mic').hidden=false;
+$('mic').onclick=function(){navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){
+ var mt=['audio/webm;codecs=opus','audio/mp4','audio/webm','audio/ogg;codecs=opus'].filter(function(t){return MediaRecorder.isTypeSupported(t)})[0],ch=[];
+ var r=rec={mr:new MediaRecorder(st,mt?{mimeType:mt}:{}),t0:Date.now(),cancel:false};
+ r.mr.ondataavailable=function(e){if(e.data&&e.data.size)ch.push(e.data)};
+ r.mr.onstop=function(){st.getTracks().forEach(function(t){t.stop()});clearInterval(r.iv);rec=null;$('rec').hidden=true;$('cf').hidden=false;pad();
+  if(r.cancel||!ch.length||Date.now()-r.t0<800)return;var b=new Blob(ch,{type:r.mr.mimeType||mt||'audio/webm'});pend={kind:'audio',blob:b,mime:b.type};send()};
+ r.mr.start();$('rec').hidden=false;$('cf').hidden=true;pad();
+ r.iv=setInterval(function(){var s=Math.floor((Date.now()-r.t0)/1000);$('rect').textContent=Math.floor(s/60)+':'+('0'+s%60).slice(-2);if(s>=120)r.mr.stop()},250)},
+ function(){err("Micro refusé : autorise-le dans les réglages du navigateur.")})};
+$('recok').onclick=function(){if(rec)rec.mr.stop()};$('recx').onclick=function(){if(rec){rec.cancel=true;rec.mr.stop()}};
+window.react=function(pid,e){xhr('/api/groupe/reagir/'+pid,JSON.stringify({e:e}),'application/json').then(function(d){var b=$('rx'+pid);b.innerHTML=d.html;var c=b.querySelector('.rch.on');if(c)c.classList.add('bump')},function(x){err(x.message)})};
+window.zoom=function(src){var o=document.createElement('div');o.className='zoom';o.innerHTML='<img src="'+src+'" alt="">';o.onclick=function(){o.remove()};document.body.appendChild(o)};
+var ol=$('older');if(ol)ol.onclick=function(){var b=this;fetch('/api/groupe/'+CID+'/fil?avant='+first,{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){
+ var h=document.documentElement,old=h.scrollHeight;put(d.html,true);if(d.first)first=d.first;window.scrollTo(0,window.scrollY+h.scrollHeight-old);if(!d.more)b.parentNode.remove()}).catch(function(){err('Chargement impossible.')})};
+pad();down(false);addEventListener('resize',pad);
+})()</script>{% endif %}{% endblock %}"""
 
 T["quiz.html"] = r"""{% extends "base.html" %}{% from "m.html" import cd with context %}{% block c %}
 <div id="home"><h1>Tournoi</h1><div class="card" style="text-align:center"><small class="mut">Début dans :</small>{{ cd(eta) }}
@@ -1611,7 +1881,7 @@ T["settings.html"] = r"""{% extends "base.html" %}{% from "m.html" import item, 
 <div class="sec">Mes données</div><div class="grp"><form method="post" action="/export">{{ csrf() }}<button class="it"><span class="ico">{{ ic('dl',19) }}</span><span class="grow">Exporter mes données (JSON)</span></button></form></div>
 <div class="grp"><form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button class="it"><span class="ico">{{ ic('out',19) }}</span><span class="grow">Se déconnecter</span></button></form></div>
 <div class="sec" style="color:#ff6b81">Zone dangereuse</div><div class="grp" style="padding:12px 16px"><form method="post" onsubmit="return confirm('Supprimer définitivement ?')">{{ csrf() }}<input type="hidden" name="action" value="delete"><small class="mut">Irréversible. Tape ton pseudo et ton mot de passe.</small><input name="confirm" placeholder="Ton pseudo" style="margin:8px 0"><input type="password" name="password" placeholder="Mot de passe"><p><button class="btn s r">Supprimer mon compte</button></p></form></div>
-<p class="mut" style="text-align:center;font-size:.72rem">SenpaiX v4 · Jikan + AniList</p>{% endblock %}"""
+<p class="mut" style="text-align:center;font-size:.72rem">SenpaiX v4 · Jikan + AniList</p><div style="margin-top: 15px; text-align: center;"><a href="https://pubads.g.doubleclick.net/gampad/ads..." target="_blank" style="font-size: 0.75rem; color: var(--mut);">Publicité - Google AdSense</a></div>{% endblock %}"""
 
 T["auth.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><div class="logo" style="font-size:2.6rem">Senpai<b>X</b></div><p class="mut" style="margin:4px 0 14px">L'univers Otaku autrement.</p>
 <div class="seg"><a class="{{ '' if reg else 'on' }}" href="/connexion">Connexion</a><a class="{{ 'on' if reg }}" href="/inscription">Inscription</a></div>
@@ -1637,7 +1907,7 @@ $('p2').oninput=function(){var o=$('p2m');if(!this.value){o.textContent='';retur
 
 T["about.html"] = r"""{% extends "base.html" %}{% block c %}<h1>À propos</h1><div class="card"><div class="row">{{ ava(creator,56) }}<div><b>{{ creator }}</b><small class="mut" style="display:block">Créateur · Guinée 🇬🇳</small></div></div><p>{{ bio }}</p></div>
 <div class="grp"><a class="it" href="mailto:{{ email }}"><span class="ico">{{ ic('mail',19) }}</span><span class="grow">{{ email }}</span></a><a class="it" href="https://wa.me/{{ wa }}"><span class="ico">{{ ic('msg',19) }}</span><span class="grow">WhatsApp {{ wa_show }}</span></a><a class="it" href="{{ fb }}"><span class="ico">{{ ic('users',19) }}</span><span class="grow">Facebook</span></a></div>
-<p class="mut" style="font-size:.8rem">Sources des données : Jikan (MyAnimeList) et AniList. Aucune publicité.</p>{% endblock %}"""
+<p class="mut" style="font-size:.8rem">Sources des données : Jikan (MyAnimeList) et AniList. Publicité Google AdSense intégrée.</p>{% endblock %}"""
 
 T["diag.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Diagnostic</h1><p class="mut">Test des sources depuis ton navigateur.</p>
 <div class="grp"><div class="it"><span class="grow">Internet<small id="d0">…</small></span></div><div class="it"><span class="grow">AniList<small id="d1">…</small></span></div><div class="it"><span class="grow">Jikan (MyAnimeList)<small id="d2">…</small></span></div></div>
@@ -1658,11 +1928,11 @@ T["forgot.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><
 
 T["priv.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Politique de confidentialité</h1><p class="mut">Dernière mise à jour : 24 octobre 2026</p>
 <div class="card"><h2>Qui sommes-nous ?</h2><p>SenpaiX est un réseau social pour fans de mangas et d'animés, créé et géré par {{ creator }} (Guinée). Contact : <a href="mailto:{{ email }}" style="color:var(--or)">{{ email }}</a>.</p>
-<h2>Données que nous collectons</h2><p>• <b>Compte</b> : pseudo, mot de passe (stocké uniquement sous forme chiffrée/hachée, nous ne pouvons pas le lire), e-mail (facultatif), code de récupération (haché).<br>• <b>Contenu</b> : ta photo de profil et ta bannière (réduites puis stockées dans notre base de données), tes publications, commentaires, messages privés, favoris, groupes rejoints et scores de quiz.<br>• <b>Technique</b> : un cookie de session indispensable à ta connexion. Pas de pistage publicitaire, pas de cookies marketing.</p>
+<h2>Données que nous collectons</h2><p>• <b>Compte</b> : pseudo, mot de passe (stocké uniquement sous forme chiffrée/hachée, nous ne pouvons pas le lire), e-mail (facultatif), code de récupération (haché).<br>• <b>Contenu</b> : ta photo de profil et ta bannière (réduites puis stockées dans notre base de données), tes publications, commentaires, messages privés, favoris, groupes rejoints et scores de quiz.<br>• <b>Technique</b> : un cookie de session indispensable à ta connexion. Intégration de bannières publicitaires Google AdSense.</p>
 <h2>Pourquoi ?</h2><p>Uniquement pour faire fonctionner l'application : te connecter, afficher ton profil et tes publications, gérer les messages, notifications, classements et favoris.</p>
 <h2>Services tiers</h2><p>Les fiches, affiches et tendances viennent de <b>AniList</b> et de <b>Jikan / MyAnimeList</b>. Quand tu les consultes, ton navigateur contacte directement ces services : ils peuvent voir ton adresse IP, selon leurs propres politiques. Nous ne leur envoyons ni ton pseudo ni tes données de compte. Ton navigateur garde aussi un cache local (catalogue) pour aller plus vite.</p>
 <h2>Modération</h2><p>Les modérateurs peuvent consulter les contenus publics (publications, commentaires, messages de groupe) et les signalements pour faire respecter les conditions. Ils ne lisent pas tes messages privés.</p>
-<h2>Partage</h2><p>Nous ne vendons ni ne louons tes données et n'affichons aucune publicité. Tes publications sont visibles des autres membres ; un profil « privé » masque ton profil. Les messages privés ne sont visibles que des deux personnes. Nous pouvons divulguer des informations si la loi l'exige.</p>
+<h2>Partage</h2><p>Nous ne vendons ni ne louons tes données et affichons des publicités légères (Google AdSense). Tes publications sont visibles des autres membres ; un profil « privé » masque ton profil. Les messages privés ne sont visibles que des deux personnes. Nous pouvons divulguer des informations si la loi l'exige.</p>
 <h2>Conservation et sécurité</h2><p>Tes données sont conservées tant que ton compte existe. Les mots de passe sont hachés, les formulaires protégés contre les attaques CSRF, les tentatives de connexion limitées. Aucun système n'est infaillible : choisis un mot de passe unique et solide.</p>
 <h2>Tes droits</h2><p>Dans <b>Paramètres</b> tu peux : modifier ton profil et ton e-mail, <b>exporter</b> tes données (JSON) et <b>supprimer définitivement</b> ton compte (tout ton contenu est effacé). Pour toute autre demande, écris-nous.</p>
 <h2>Mineurs</h2><p>SenpaiX est réservé aux personnes de 13 ans et plus. Si tu penses qu'un enfant plus jeune a un compte, préviens-nous pour qu'il soit supprimé.</p>
@@ -1700,7 +1970,7 @@ T["admin.html"] = r"""{% extends "adm.html" %}{% block a %}
 <div class="kpi">{% for k,l in [('users','Membres'),('u1','Inscrits 24 h'),('u7','Inscrits 7 j'),('posts','Posts'),('comments','Commentaires'),('groups','Groupes'),('reports','Signalements'),('banned','Suspendus'),('msgs','Messages')] %}<div style="margin-bottom:8px"><b>{{ stats[k] }}</b><small>{{ l }}</small></div>{% endfor %}</div>
 <h2>Signalements ouverts</h2>
 {% for x in rows %}<div class="card"><small class="mut">{{ x.r.kind }} · {{ x.r.reason }} · par {{ x.r.rep }} · {{ ago(x.r.created) }}</small>
-{% if x.t %}<p style="margin:8px 0"><a href="/admin/membre/{{ x.t.uid }}" style="color:var(--or2)"><b>{{ x.t.username }}</b></a> : {{ x.t.body[:300] }}</p>{% else %}<p class="mut">Contenu déjà supprimé.</p>{% endif %}
+{% if x.t %}<p style="margin:8px 0"><a href="/admin/membre/{{ x.t.uid }}" style="color:var(--or2)"><b>{{ x.t.username }}</b></a> : {{ x.t.body[:300] }}</p><p class="mut">Contenu déjà supprimé.</p>{% endif %}
 <form method="post" action="/admin/action" class="row" style="flex-wrap:wrap">{{ csrf() }}<input type="hidden" name="id" value="{{ x.r.id }}"><button class="btn s g" name="act" value="dismiss">Ignorer</button>{% if x.t and x.r.kind!='user' %}<button class="btn s" name="act" value="rdelete">Supprimer le contenu</button>{% endif %}{% if x.t %}<button class="btn s r" name="act" value="rban">Suspendre l'auteur</button>{% endif %}</form></div>
 {% else %}<p class="mut" style="text-align:center">Aucun signalement ouvert. 🎉</p>{% endfor %}
 <h2>Journal des actions</h2><div class="grp">{% for l in log %}<div class="it"><span class="grow">{{ l.adm }} · {{ l.action }} {{ l.target }}<small>{{ l.detail }} · {{ ago(l.created) }}</small></span></div>{% else %}<div class="it mut">Aucune action pour l'instant.</div>{% endfor %}</div>{% endblock %}"""
@@ -1715,10 +1985,10 @@ T["admin_user.html"] = r"""{% extends "adm.html" %}{% block a %}<div class="card
 {% else %}<form method="post" action="/admin/action">{{ csrf() }}<input type="hidden" name="id" value="{{ u.id }}"><label style="margin-top:0">Motif de suspension (affiché à la personne)</label><input name="reason" maxlength="120" placeholder="Ex : harcèlement"><p><button class="btn s r" name="act" value="ban">Suspendre ce compte</button></p></form>{% endif %}
 <form method="post" action="/admin/action" onsubmit="return confirm('Supprimer définitivement ce compte et tout son contenu ?')">{{ csrf() }}<input type="hidden" name="id" value="{{ u.id }}"><label>Supprimer le compte : retape le pseudo pour confirmer</label><input name="confirm" placeholder="{{ u.username }}" autocomplete="off"><p><button class="btn s g" name="act" value="delete_user">Supprimer définitivement</button></p></form></div>{% endif %}
 {% for title,items,kind in [('Posts',posts,'post'),('Commentaires',comments,'comment'),('Messages de groupe',cposts,'cpost')] %}<h2>{{ title }}</h2>
-{% for p in items %}<div class="card row"><span class="grow">{{ p.body[:200] }}<small class="mut" style="display:block">{{ ago(p.created) }}</small></span><form method="post" action="/admin/action">{{ csrf() }}<input type="hidden" name="id" value="{{ p.id }}"><input type="hidden" name="kind" value="{{ kind }}"><button class="btn s g" name="act" value="delete_content">{{ ic('trash',14) }}</button></form></div>{% else %}<p class="mut">Rien.</p>{% endfor %}{% endfor %}{% endblock %}"""
+{% for p in items %}<div class="card row"><span class="grow">{% if p.mk %}<a href="/api/groupe/media/{{ p.id }}" target="_blank" style="color:var(--or2)">📎 {{ p.mk }}</a> {% endif %}{{ p.body[:200] }}<small class="mut" style="display:block">{{ ago(p.created) }}</small></span><form method="post" action="/admin/action">{{ csrf() }}<input type="hidden" name="id" value="{{ p.id }}"><input type="hidden" name="kind" value="{{ kind }}"><button class="btn s g" name="act" value="delete_content">{{ ic('trash',14) }}</button></form></div>{% else %}<p class="mut">Rien.</p>{% endfor %}{% endfor %}{% endblock %}"""
 
 T["admin_content.html"] = r"""{% extends "adm.html" %}{% block a %}{% for title,items,kind in [('Derniers posts',posts,'post'),('Derniers commentaires',comments,'comment'),('Derniers messages de groupe',cposts,'cpost')] %}<h2>{{ title }}</h2>
-{% for p in items %}<div class="card"><small class="mut"><a href="/admin/membre/{{ p.uid }}" style="color:var(--or2)">{{ p.username }}</a> · {{ ago(p.created) }}</small><p style="margin:6px 0">{{ p.body[:250] }}</p>
+{% for p in items %}<div class="card"><small class="mut"><a href="/admin/membre/{{ p.uid }}" style="color:var(--or2)">{{ p.username }}</a> · {{ ago(p.created) }}</small><p style="margin:6px 0">{% if p.mk %}<a href="/api/groupe/media/{{ p.id }}" target="_blank" style="color:var(--or2)">📎 {{ p.mk }}</a> {% endif %}{{ p.body[:250] }}</p>
 <form method="post" action="/admin/action">{{ csrf() }}<input type="hidden" name="id" value="{{ p.id }}"><input type="hidden" name="kind" value="{{ kind }}"><button class="btn s g" name="act" value="delete_content">Supprimer</button></form></div>{% else %}<p class="mut">Rien.</p>{% endfor %}{% endfor %}{% endblock %}"""
 
 T["customize.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Personnaliser mon profil</h1>
@@ -1761,6 +2031,7 @@ T["err.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><h1 
 
 app.jinja_loader = DictLoader(T)
 app.jinja_env.globals["css"] = CSS
+app.jinja_env.globals.update(REACTS=REACTS, MEDIA_MAX=MEDIA_MAX)
 app.jinja_env.globals["js"] = '\nfunction $(x){return document.getElementById(x)}\nfunction esc(s){return String(s==null?\'\':s).replace(/[&<>"\']/g,function(c){return{\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]})}\nvar JK=\'https://api.jikan.moe/v4\',DAYS=[\'monday\',\'tuesday\',\'wednesday\',\'thursday\',\'friday\',\'saturday\',\'sunday\'];\nfunction nerr(e){var m=e&&e.message||String(e);return e&&e.name==\'AbortError\'?\'délai dépassé\':(/Failed to fetch|Load failed|NetworkError/i.test(m)?\'connexion impossible\':m)}\nfunction req(u,o){var ac=new AbortController(),t=setTimeout(function(){ac.abort()},9000);o=o||{};o.signal=ac.signal;\n return fetch(u,o).then(function(r){clearTimeout(t);if(!r.ok)throw new Error(\'HTTP \'+r.status);return r.json()}).catch(function(e){clearTimeout(t);throw new Error(nerr(e))})}\nfunction get(u){return req(u)}\nfunction AL(q,v){return req(\'https://graphql.anilist.co\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({query:q,variables:v||{}})}).then(function(d){if(d.errors)throw new Error(d.errors[0].message);return d.data})}\nfunction purge(){Object.keys(localStorage).forEach(function(x){if(x.indexOf(\'c:\')==0)localStorage.removeItem(x)})}\nfunction cache(k,ttl,fn){k=\'c:\'+k;var c=null;try{c=JSON.parse(localStorage.getItem(k))}catch(e){}\n if(c&&Date.now()-c.t<ttl*6e4)return Promise.resolve(c.d);\n return fn().then(function(d){try{localStorage.setItem(k,JSON.stringify({t:Date.now(),d:d}))}catch(e){purge()}return d},function(e){if(c)return c.d;throw e})}\nfunction strip(s){return String(s||\'\').replace(/<[^>]*>/g,\' \').replace(/\\s+/g,\' \').trim()}\nfunction uniq(l){var s={};return l.filter(function(x){return x.id&&!s[x.id]&&(s[x.id]=1)})}\nfunction shuf(a){for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1)),t=a[i];a[i]=a[j];a[j]=t}return a}\nvar MF=\'idMal isAdult title{romaji english} coverImage{large} averageScore seasonYear startDate{year} episodes chapters format genres studios(isMain:true){nodes{name}} description(asHtml:false)\';\nfunction alm(m){return{id:m.idMal,title:(m.title&&(m.title.english||m.title.romaji))||\'?\',img:(m.coverImage&&m.coverImage.large)||\'\',score:m.averageScore?Math.round(m.averageScore)/10:null,\n year:m.seasonYear||(m.startDate&&m.startDate.year)||null,eps:m.episodes||m.chapters||null,type:m.format||\'\',genres:(m.genres||[]).join(\', \'),\n studio:((m.studios&&m.studios.nodes)||[]).map(function(n){return n.name}).join(\', \'),syn:strip(m.description)}}\nfunction nm(it){var im=(it.images&&it.images.jpg)||{};return{id:it.mal_id,title:it.title_english||it.title||\'?\',img:im.large_image_url||im.image_url||\'\',score:it.score,\n year:it.year||(it.aired&&it.aired.prop&&it.aired.prop.from&&it.aired.prop.from.year),syn:(it.synopsis||\'\').trim(),type:it.type,eps:it.episodes||it.chapters,\n genres:(it.genres||[]).map(function(g){return g.name}).join(\', \'),studio:(it.studios||[]).map(function(g){return g.name}).join(\', \')}}\nfunction fin(a){return uniq(a.filter(function(m){return m&&m.idMal&&!m.isAdult}).map(alm))}\nfunction season(){var d=new Date();return{s:[\'WINTER\',\'SPRING\',\'SUMMER\',\'FALL\'][Math.floor(d.getMonth()/3)],y:d.getFullYear()}}\nfunction dayRange(day){var n=new Date(),tm=(n.getDay()+6)%7,d=new Date(n.getFullYear(),n.getMonth(),n.getDate()+DAYS.indexOf(day)-tm),a=Math.floor(d.getTime()/1000);return[a-1,a+86400]}\nvar STOP={moi:1,quand:1,que:1,qui:1,les:1,des:1,une:1,dans:1,sur:1,pour:1,par:1,avec:1,mon:1,mes:1,son:1,ses:1,est:1,sont:1,the:1,and:1,anime:1,manga:1,saison:1};\nfunction kws(q){return q.toLowerCase().normalize(\'NFD\').replace(/[\\u0300-\\u036f]/g,\'\').replace(/[^a-z0-9\\s]/g,\' \').split(/\\s+/).filter(function(w){return w.length>2&&!STOP[w]}).map(function(w){return/^reincarn/.test(w)?\'reincarnated\':w})}\nfunction alQ(q,sort){return AL(\'query($q:String){Page(page:1,perPage:30){media(type:ANIME,isAdult:false,search:$q,sort:\'+sort+\'){\'+MF+\'}}}\',{q:q}).then(function(d){return fin(d.Page.media)})}\nfunction srch(q){return alQ(q,\'SEARCH_MATCH\').then(function(l){if(l.length)return l;var k=kws(q);if(!k.length)return[];\n return alQ(k.join(\' \'),\'SEARCH_MATCH\').then(function(l2){if(l2.length)return l2;\n  return Promise.all(k.map(function(w){return alQ(w,\'POPULARITY_DESC\').catch(function(){return[]})})).then(function(arr){var sc={},by={};arr.forEach(function(a){a.forEach(function(m){by[m.id]=m;sc[m.id]=(sc[m.id]||0)+1})});\n   return Object.keys(by).map(function(i){return by[i]}).sort(function(a,b){return sc[b.id]-sc[a.id]})})})})}\nfunction alList(kind,o,pg){\n if(kind==\'search\')return srch(o.q||\'\');\n if(kind==\'planning\'){var r=dayRange(o.day||\'monday\');return AL(\'query($a:Int,$b:Int){Page(perPage:50){airingSchedules(airingAt_greater:$a,airingAt_lesser:$b,sort:TIME){media{\'+MF+\'}}}}\',{a:r[0],b:r[1]}).then(function(d){return fin(d.Page.airingSchedules.map(function(x){return x.media}))})}\n var v={p:pg,t:kind==\'manga\'?\'MANGA\':\'ANIME\'},decl=\'$p:Int,$t:MediaType\',args=\'type:$t,isAdult:false\',sort=\'POPULARITY_DESC\';\n if(kind==\'saison\'){var z=season();v.s=z.s;v.y=z.y;decl+=\',$s:MediaSeason,$y:Int\';args+=\',season:$s,seasonYear:$y\'}\n else if(kind==\'top\'){sort=\'SCORE_DESC\';args+=\',popularity_greater:30000\'}\n else if(kind==\'manga\'){sort=\'SCORE_DESC\';args+=\',popularity_greater:10000\'}\n else if(kind==\'trend\')sort=\'TRENDING_DESC\';\n else if(kind==\'explore\'){sort=o.sort||\'POPULARITY_DESC\';args+=\',popularity_greater:3000\';if(o.genre){v.g=o.genre;decl+=\',$g:String\';args+=\',genre:$g\'}if(o.year){v.a=o.year*10000;v.b=o.year*10000+10000;decl+=\',$a:FuzzyDateInt,$b:FuzzyDateInt\';args+=\',startDate_greater:$a,startDate_lesser:$b\'}if(o.min){v.m=+o.min*10;decl+=\',$m:Int\';args+=\',averageScore_greater:$m\'}}\n  return AL(\'query(\'+decl+\'){Page(page:$p,perPage:30){media(\'+args+\',sort:\'+sort+\'){\'+MF+\'}}}\',v).then(function(d){return fin(d.Page.media)})}\nfunction jkList(kind,o,pg){\n var P={saison:\'/seasons/now?limit=24&sfw=true&page=\'+pg,trend:\'/seasons/now?limit=14&sfw=true\',explore:\'/top/anime?limit=25&sfw=true&page=\'+pg,top:\'/top/anime?limit=25&sfw=true&page=\'+pg,manga:\'/top/manga?limit=24&sfw=true&page=\'+pg,\n  planning:\'/schedules?filter=\'+(o.day||\'monday\')+\'&limit=24&sfw=true\',search:\'/anime?q=\'+encodeURIComponent(o.q||\'\')+\'&limit=12&sfw=true&order_by=popularity\'};\n return get(JK+P[kind]).then(function(d){return uniq((d.data||[]).map(nm))})}\nfunction L(kind,o){o=o||{};var pg=o.page||1;\n return cache([kind,o.day||\'\',pg,o.q||\'\',o.genre||\'\',o.year||\'\',o.sort||\'\',o.min||\'\'].join(\'|\'),30,function(){\n  return alList(kind,o,pg).then(function(l){if(!l.length&&kind!=\'search\')throw new Error(\'liste vide\');return l}).catch(function(e1){return jkList(kind,o,pg).catch(function(e2){throw new Error(\'AniList : \'+e1.message+\' · Jikan : \'+e2.message)})})})}\nfunction M(id,kind){return cache(\'m\'+kind+id,60,function(){\n return AL(\'query($i:Int,$t:MediaType){Media(idMal:$i,type:$t){\'+MF+\' nextAiringEpisode{airingAt episode} trailer{id site} characters(perPage:10,sort:ROLE){nodes{name{full} image{medium}}}}}\',{i:id,t:kind==\'manga\'?\'MANGA\':\'ANIME\'}).then(function(d){var x=d.Media,m=alm(x);\n  m.next=x.nextAiringEpisode||null;m.trailer=x.trailer&&x.trailer.site==\'youtube\'?\'https://youtu.be/\'+x.trailer.id:\'\';m.chars=x.characters.nodes.map(function(c){return{title:c.name.full,img:c.image.medium}});return m})\n .catch(function(e1){return get(JK+\'/\'+(kind==\'manga\'?\'manga\':\'anime\')+\'/\'+id).then(function(d){var m=nm(d.data);m.trailer=(d.data.trailer||{}).url||\'\';m.chars=[];\n  if(kind==\'manga\')return m;return get(JK+\'/anime/\'+id+\'/characters\').then(function(c){m.chars=(c.data||[]).slice(0,10).map(function(x){return{title:x.character.name,img:x.character.images.jpg.image_url}});return m}).catch(function(){return m})})})})}\nfunction skI(n){var h=\'\';for(var i=0;i<n;i++)h+=\'<div class="tile"><div class="sk" style="aspect-ratio:2/3;border-radius:14px"></div><div class="sk" style="height:10px;margin-top:6px;width:70%"></div></div>\';return h}\nfunction skT(n){return\'<div class="grid">\'+skI(n)+\'</div>\'}\nfunction skC(n){var h=\'\';for(var i=0;i<n;i++)h+=\'<div class="st"><div class="sk" style="width:72px;height:72px;border-radius:50%"></div></div>\';return h}\nfunction tileItems(l,k){return l.map(function(m){return\'<a class="tile" href="/serie/\'+m.id+(k==\'manga\'?\'?k=manga\':\'\')+\'"><img src="\'+esc(m.img)+\'" loading="lazy" alt="">\'+(m.score?\'<small>★ \'+m.score+\'</small>\':\'\')+\'<b>\'+esc(m.title)+\'</b></a>\'}).join(\'\')}\nfunction tiles(l,k){return l.length?\'<div class="grid">\'+tileItems(l,k)+\'</div>\':\'<p class="mut" style="text-align:center">Aucun résultat.</p>\'}\nfunction rings(l){return l.map(function(m){return\'<a class="st" href="/serie/\'+m.id+\'"><div class="ring"><img src="\'+esc(m.img)+\'" alt="" loading="lazy"></div><span>\'+esc(m.title)+\'</span></a>\'}).join(\'\')}\nfunction posters(l){return l.map(function(m){return\'<a class="st" style="width:96px" href="/serie/\'+m.id+\'"><img src="\'+esc(m.img)+\'" alt="" loading="lazy" style="border-radius:14px;aspect-ratio:2/3;border:0;object-fit:cover;width:100%"><span>\'+esc(m.title)+\'</span></a>\'}).join(\'\')}\nfunction fail(el,e){el.innerHTML=\'<p class="mut" style="grid-column:1/-1;text-align:center;padding:14px">Sources injoignables.<br><small>\'+esc(e&&e.message||e)+\'</small><br><a href="" style="color:var(--or)">Réessayer</a> · <a href="/diagnostic" style="color:var(--or)">Diagnostic</a></p>\'}\n\nfunction dur(s){s=Math.max(0,s);var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+\' j \'+h+\' h\':h?h+\' h \'+m+\' min\':m+\' min\'}\nfunction NX(ids){if(!ids.length)return Promise.resolve({});return cache(\'nx|\'+ids.join(\',\'),30,function(){\n return AL(\'query($i:[Int]){Page(perPage:50){media(idMal_in:$i,type:ANIME){idMal title{romaji english} coverImage{large} nextAiringEpisode{airingAt episode}}}}\',{i:ids.slice(0,50)}).then(function(d){var o={};\n  d.Page.media.forEach(function(m){if(m.nextAiringEpisode)o[m.idMal]={at:m.nextAiringEpisode.airingAt,ep:m.nextAiringEpisode.episode,title:m.title.english||m.title.romaji,img:m.coverImage.large}});return o})})}\n\nfunction fx(b,t){b.innerHTML=\'\';var m={sakura:[\'🌸\',\'fall\'],stars:[\'✨\',\'twk\'],snow:[\'❄️\',\'fall\'],flames:[\'🔥\',\'rise\']}[t];if(!m||(window.matchMedia&&matchMedia(\'(prefers-reduced-motion: reduce)\').matches))return;\n for(var i=0;i<16;i++){var e=document.createElement(\'span\');e.className=\'fxp \'+m[1];e.textContent=m[0];e.style.left=(Math.random()*94)+\'%\';e.style.fontSize=(10+Math.random()*14)+\'px\';\n  e.style.animationDuration=(4+Math.random()*6)+\'s\';e.style.animationDelay=(-Math.random()*8)+\'s\';if(m[1]==\'twk\')e.style.top=(Math.random()*85)+\'%\';b.appendChild(e)}}\n'
 
 def ensure_admin():
@@ -1825,29 +2096,3 @@ def ensure_ready():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
 
-
-import cloudinary.uploader
-
-@app.route('/group/<int:group_id>/send', methods=['POST'])
-def send_group_message(group_id):
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-    
-    content = request.form.get('content')
-    file = request.files.get('media')
-    media_url = None
-
-    if file and file.filename != '':
-        upload_result = cloudinary.uploader.upload(file, resource_type="auto")
-        media_url = upload_result.get('secure_url')
-
-    new_message = GroupMessage(
-        content=content,
-        media_url=media_url,
-        user_id=session['user_id'],
-        group_id=group_id
-    )
-    db.session.add(new_message)
-    db.session.commit()
-    
-    return redirect(url_for('view_group', group_id=group_id))
