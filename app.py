@@ -1825,3 +1825,29 @@ def ensure_ready():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
 
+
+import cloudinary.uploader
+
+@app.route('/group/<int:group_id>/send', methods=['POST'])
+def send_group_message(group_id):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    content = request.form.get('content')
+    file = request.files.get('media')
+    media_url = None
+
+    if file and file.filename != '':
+        upload_result = cloudinary.uploader.upload(file, resource_type="auto")
+        media_url = upload_result.get('secure_url')
+
+    new_message = GroupMessage(
+        content=content,
+        media_url=media_url,
+        user_id=session['user_id'],
+        group_id=group_id
+    )
+    db.session.add(new_message)
+    db.session.commit()
+    
+    return redirect(url_for('view_group', group_id=group_id))
