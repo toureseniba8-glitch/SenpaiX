@@ -93,6 +93,11 @@ CREATE TABLE IF NOT EXISTS cmedia(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES 
 CREATE TABLE IF NOT EXISTS creacts(pid INTEGER REFERENCES cposts(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,emo TEXT,PRIMARY KEY(pid,user_id));
 CREATE INDEX IF NOT EXISTS cmedia_pid ON cmedia(pid);
 CREATE INDEX IF NOT EXISTS cposts_cid ON cposts(cid,id);
+CREATE TABLE IF NOT EXISTS pmedia(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES posts(id) ON DELETE CASCADE,mime TEXT,data BLOB,created TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS pmedia_pid ON pmedia(pid);
+CREATE TABLE IF NOT EXISTS popts(id INTEGER PRIMARY KEY,post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,label TEXT NOT NULL,pos INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS pvotes(post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,opt_id INTEGER REFERENCES popts(id) ON DELETE CASCADE,PRIMARY KEY(post_id,user_id));
+CREATE TABLE IF NOT EXISTS cimg(cid INTEGER REFERENCES communities(id) ON DELETE CASCADE,kind TEXT NOT NULL,data BLOB,PRIMARY KEY(cid,kind));
 CREATE TABLE IF NOT EXISTS favs(user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,mal_id INTEGER,title TEXT,img TEXT,
  PRIMARY KEY(user_id,mal_id));
 CREATE TABLE IF NOT EXISTS scores(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -144,14 +149,14 @@ if PG:
 else:
     DBError = sqlite3.Error
 DURABLE = PG or not PROD      # sur Render sans Postgres, SQLite est effacé à chaque mise à jour
-ID_TABLES = {"users", "posts", "comments", "communities", "cposts", "cmedia", "scores", "notifs", "msgs", "reports", "admin_log"}
+ID_TABLES = {"users", "posts", "comments", "communities", "cposts", "cmedia", "pmedia", "scores", "notifs", "msgs", "reports", "admin_log"}
 FAV_UPSERT = (" ON CONFLICT (user_id,mal_id) DO UPDATE SET title=EXCLUDED.title,img=EXCLUDED.img,status=EXCLUDED.status,ep=EXCLUDED.ep,"
               "total=EXCLUDED.total,score=EXCLUDED.score,kind=EXCLUDED.kind,updated=EXCLUDED.updated")
 MIGRATIONS = (("users", "email TEXT DEFAULT ''"), ("users", "recovery TEXT DEFAULT ''"), ("users", "banned INTEGER DEFAULT 0"),
               ("users", "is_admin INTEGER DEFAULT 0"), ("users", "ban_reason TEXT DEFAULT ''"), ("users", "av INTEGER DEFAULT 0"), ("users", "bv INTEGER DEFAULT 0"),
               ("users", "p_ring TEXT DEFAULT 'none'"), ("users", "p_fx TEXT DEFAULT 'none'"), ("users", "p_name TEXT DEFAULT 'normal'"),
               ("users", "p_banner TEXT DEFAULT 'sunset'"), ("users", "p_color TEXT DEFAULT '#ff6a1a'"), ("users", "p_status TEXT DEFAULT ''"),
-              ("cposts", "mk TEXT DEFAULT ''"), ("favs", "status TEXT DEFAULT 'voir'"), ("favs", "ep INTEGER DEFAULT 0"), ("favs", "total INTEGER DEFAULT 0"),
+              ("cposts", "mk TEXT DEFAULT ''"), ("posts", "has_img INTEGER DEFAULT 0"), ("users", "otype TEXT DEFAULT ''"), ("communities", "av INTEGER DEFAULT 0"), ("communities", "cv INTEGER DEFAULT 0"), ("favs", "status TEXT DEFAULT 'voir'"), ("favs", "ep INTEGER DEFAULT 0"), ("favs", "total INTEGER DEFAULT 0"),
               ("favs", "score INTEGER DEFAULT 0"), ("favs", "kind TEXT DEFAULT 'anime'"), ("favs", "updated TEXT DEFAULT ''"))
 
 
@@ -432,6 +437,7 @@ ICONS = {
     "dots": "M12 5h.01M12 12h.01M12 19h.01",
     "image": "M3 5h18v14H3zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM21 15l-5-5L5 19",
     "video": "M2 6h13v12H2zM15 10l7-4v12l-7-4",
+    "plus": "M12 5v14M5 12h14", "chart": "M4 20V10M10 20V4M16 20v-8M22 20H2", "edit": "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z",
     "mic": "M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v1a7 7 0 0 1-14 0v-1M12 18v4M8 22h8",
     "smile": "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01", "send": "M22 2L11 13M22 2l-7 20-4-9-9-4z", "star": "M12 2l3 7 7 .6-5.3 4.8 1.6 7.4L12 18l-6.3 3.8 1.6-7.4L2 9.6 9 9z",
 }
@@ -461,7 +467,7 @@ def inject():
 def small_posts():
     """Seuls les envois de médias de groupe peuvent dépasser 256 Ko."""
     if request.method == "POST" and (request.content_length or 0) > 256 * 1024 \
-            and not (request.path.startswith("/api/groupe/") and request.path.endswith("/envoi")):
+            and request.path != "/api/publier" and not (request.path.startswith("/api/groupe/") and request.path.endswith("/envoi")):
         abort(413)
 
 
@@ -490,7 +496,7 @@ def throttle(key, limit, window):
 
 
 POSTQ = ("SELECT p.*,u.username,(SELECT COUNT(*) FROM likes WHERE post_id=p.id) lc,"
-         "(SELECT COUNT(*) FROM comments WHERE post_id=p.id) cc,"
+         "(SELECT COUNT(*) FROM comments WHERE post_id=p.id) cc,(SELECT COUNT(*) FROM popts WHERE post_id=p.id) np,"
          "(SELECT COUNT(*) FROM likes WHERE post_id=p.id AND user_id=?) liked FROM posts p JOIN users u ON u.id=p.user_id ")
 
 
@@ -518,6 +524,31 @@ def search():
     return render_template("search.html", title="Recherche", q=qs, us=us)
 
 
+def post_mal(src):
+    """Série liée à une publication (depuis un formulaire ou une query) -> (mal_id, titre, image)."""
+    mid = toint(src.get("mal_id"), 0, 0, 10 ** 9) or None
+    t = txt(src.get("m_title"), 120) if mid else None
+    img = src.get("m_img", "") if mid else None
+    if img and not img.startswith("https://cdn.myanimelist.net/"):
+        img = ""
+    return mid, t, img
+
+
+def clean_opts(lst):
+    o = [x for x in (txt(v, 40) for v in lst) if x][:4]
+    return o if len(o) >= 2 else []
+
+
+def new_post(d, body, mid, t, img, opts, photo=None):
+    pid = d.execute("INSERT INTO posts(user_id,body,mal_id,m_title,m_img,created,has_img) VALUES(?,?,?,?,?,?,?)",
+                    (uid(), body, mid, t, img, now(), 1 if photo else 0)).lastrowid
+    for i, o in enumerate(opts):
+        d.execute("INSERT INTO popts(post_id,label,pos) VALUES(?,?,?)", (pid, o, i))
+    if photo:
+        d.execute("INSERT INTO pmedia(pid,mime,data,created) VALUES(?,?,?,?)", (pid, photo[0], photo[1], now()))
+    return pid
+
+
 @app.route("/publier", methods=["POST"])
 @login_required
 def publish():
@@ -525,13 +556,63 @@ def publish():
     if not body or not throttle(f"pub{uid()}", 8, 300):
         flash("Message vide ou trop rapide.", "err")
         return redirect(request.referrer or "/")
-    mid = request.form.get("mal_id", type=int)
-    t = txt(request.form.get("m_title"), 120) if mid else None
-    img = request.form.get("m_img", "") if mid else None
-    if img and not img.startswith("https://cdn.myanimelist.net/"):
-        img = ""
-    db().execute("INSERT INTO posts(user_id,body,mal_id,m_title,m_img,created) VALUES(?,?,?,?,?,?)", (uid(), body, mid, t, img, now()))
+    mid, t, img = post_mal(request.form)
+    new_post(db(), body, mid, t, img, clean_opts(request.form.getlist("opt")))
     return redirect(request.referrer or "/")
+
+
+@app.route("/api/publier", methods=["POST"])
+def api_publish():
+    """Publication avec photo : corps brut = image, le reste dans l'URL (t, o, mal_id…)."""
+    if not me():
+        return jsonify(error="Connecte-toi d'abord."), 401
+    if (request.content_length or 0) > 1_600_000:
+        return jsonify(error="Image trop lourde."), 413
+    a = request.args
+    body, data = txt(a.get("t"), 1000), request.get_data(cache=False)
+    opts = clean_opts(a.getlist("o"))
+    photo = None
+    if data:
+        mime, cap = sniff("image", data)
+        if not mime:
+            return jsonify(error="Image non reconnue."), 400
+        if len(data) > cap:
+            return jsonify(error="Image trop lourde."), 413
+        photo = (mime, data)
+    if not body and not photo:
+        return jsonify(error="Écris quelque chose ou ajoute une photo."), 400
+    if opts and not body:
+        return jsonify(error="Écris la question de ton sondage."), 400
+    if not throttle(f"pub{uid()}", 8, 300):
+        return jsonify(error="Doucement ! Réessaie dans un instant."), 429
+    mid, t, img = post_mal(a)
+    return jsonify(ok=True, id=new_post(db(), body, mid, t, img, opts, photo))
+
+
+def poll_of(pid):
+    d = db()
+    rows = d.execute("SELECT o.id,o.label,(SELECT COUNT(*) FROM pvotes v WHERE v.opt_id=o.id) n FROM popts o WHERE o.post_id=? ORDER BY o.pos,o.id", (pid,)).fetchall()
+    mine = d.execute("SELECT opt_id FROM pvotes WHERE post_id=? AND user_id=?", (pid, uid())).fetchone() if me() else None
+    tot = sum(r["n"] for r in rows)
+    return dict(total=tot, mine=mine["opt_id"] if mine else 0,
+                opts=[dict(id=r["id"], label=r["label"], n=r["n"], pct=round(100 * r["n"] / tot) if tot else 0) for r in rows])
+
+
+@app.route("/api/sondage/<int:pid>/voter", methods=["POST"])
+def api_vote(pid):
+    if not me():
+        return jsonify(error="Connecte-toi pour voter."), 401
+    o = toint((request.get_json(silent=True) or {}).get("o"), 0, 0, 10 ** 12)
+    d = db()
+    if not d.execute("SELECT 1 FROM popts WHERE id=? AND post_id=?", (o, pid)).fetchone():
+        return jsonify(error="Option inconnue."), 400
+    if not throttle(f"pv{uid()}", 40, 300):
+        return jsonify(error="Doucement !"), 429
+    cur = d.execute("SELECT opt_id FROM pvotes WHERE post_id=? AND user_id=?", (pid, uid())).fetchone()
+    d.execute("DELETE FROM pvotes WHERE post_id=? AND user_id=?", (pid, uid()))
+    if not cur or cur["opt_id"] != o:     # retoucher la même option retire le vote
+        d.execute("INSERT INTO pvotes(post_id,user_id,opt_id) VALUES(?,?,?)", (pid, uid(), o))
+    return jsonify(ok=True, html=render_template("pollx.html", pid=pid))
 
 
 @app.route("/aimer/<int:pid>", methods=["POST"])
@@ -645,6 +726,68 @@ def list_set(mid):
 
 
 # ───────────────────────────── Communautés ─────────────────────────────
+GIMG = {"avatar": (70_000, "av"), "cover": (170_000, "cv")}
+
+
+def can_edit_group(c):
+    return bool(me()) and (c["creator_id"] == uid() or is_admin())
+
+
+def gav(c, size=48):
+    """Photo (ou initiale colorée) d'un groupe."""
+    r = max(10, size // 4)
+    if c["av"]:
+        return Markup(f'<img class="gav" src="/g/{c["id"]}/avatar?v={c["av"]}" alt="" loading="lazy" style="width:{size}px;height:{size}px;border-radius:{r}px">')
+    h = sum(map(ord, c["name"])) % 360
+    return Markup(f'<span class="gav" style="width:{size}px;height:{size}px;border-radius:{r}px;font-size:{size // 2.2}px;'
+                  f'background:linear-gradient(135deg,hsl({h} 85% 55%),hsl({(h + 55) % 360} 85% 45%))">{Markup.escape(c["name"][:1].upper())}</span>')
+
+
+@app.route("/g/<int:cid>/<kind>")
+def group_img(cid, kind):
+    if kind not in GIMG:
+        abort(404)
+    r = db().execute("SELECT data FROM cimg WHERE cid=? AND kind=?", (cid, kind)).fetchone() or abort(404)
+    resp = app.response_class(bytes(r["data"]), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable" if request.args.get("v") else "public, max-age=300"
+    return resp
+
+
+@app.route("/api/groupe/<int:cid>/img/<kind>", methods=["POST"])
+def api_gimg(cid, kind):
+    if not me():
+        return jsonify(error="Connecte-toi d'abord."), 401
+    if kind not in GIMG:
+        abort(404)
+    d = db()
+    c = d.execute("SELECT * FROM communities WHERE id=?", (cid,)).fetchone() or abort(404)
+    if not can_edit_group(c):
+        return jsonify(error="Seul le créateur du groupe peut changer ses images."), 403
+    data = request.get_data(cache=False)
+    if data[:3] != b"\xff\xd8\xff" or not 500 < len(data) <= GIMG[kind][0]:
+        return jsonify(error="Image invalide ou trop lourde."), 400
+    if not throttle(f"gimg{uid()}", 12, 3600):
+        return jsonify(error="Trop d'envois, réessaie plus tard."), 429
+    v = int(time.time() - 1.7e9)
+    d.execute("DELETE FROM cimg WHERE cid=? AND kind=?", (cid, kind))
+    d.execute("INSERT INTO cimg(cid,kind,data) VALUES(?,?,?)", (cid, kind, data))
+    d.execute(f"UPDATE communities SET {GIMG[kind][1]}=? WHERE id=?", (v, cid))   # colonne issue du dictionnaire GIMG, jamais de l'utilisateur
+    return jsonify(ok=True, v=v)
+
+
+@app.route("/groupe/<int:cid>/photo/supprimer", methods=["POST"])
+@login_required
+def del_gimg(cid):
+    kind = request.form.get("kind")
+    d = db()
+    c = d.execute("SELECT * FROM communities WHERE id=?", (cid,)).fetchone() or abort(404)
+    if kind not in GIMG or not can_edit_group(c):
+        abort(403)
+    d.execute("DELETE FROM cimg WHERE cid=? AND kind=?", (cid, kind))
+    d.execute(f"UPDATE communities SET {GIMG[kind][1]}=0 WHERE id=?", (cid,))
+    return redirect(f"/communaute/{cid}")
+
+
 @app.route("/communautes", methods=["GET", "POST"])
 def communities():
     d = db()
@@ -670,6 +813,64 @@ REACTS = ["👍", "❤️", "😂", "😮", "😢", "🔥"]
 # Taille maximale (octets) par type d'envoi. Les médias sont stockés dans la base : garde-les raisonnables.
 MEDIA_MAX = {"image": 600_000, "gif": 1_500_000, "video": 8_000_000, "audio": 3_000_000}
 CMAX = 60
+# Conservation des médias (photos, vidéos, vocaux) : au-delà, le fichier est supprimé mais le texte du message reste.
+# Réglable sans toucher au code : variables d'environnement MEDIA_DAYS et MEDIA_CAP_MB dans Render.
+MEDIA_DAYS = int(os.environ.get("MEDIA_DAYS", "25") or 25)
+MEDIA_CAP_MB = int(os.environ.get("MEDIA_CAP_MB", "300") or 300)
+PURGE = {"t": 0.0}
+
+
+def media_stats(d):
+    one = lambda q: d.execute(q).fetchone()[0] or 0
+    files = one("SELECT COUNT(*) FROM cmedia") + one("SELECT COUNT(*) FROM pmedia")
+    size = one("SELECT COALESCE(SUM(LENGTH(data)),0) FROM cmedia") + one("SELECT COALESCE(SUM(LENGTH(data)),0) FROM pmedia")
+    return files, size
+
+
+def purge_media(d):
+    """Supprime les médias de plus de MEDIA_DAYS jours, puis les plus anciens si le total dépasse MEDIA_CAP_MB.
+    Les messages restent : ils affichent « média expiré » à la place du fichier. Retourne le nombre de fichiers supprimés."""
+    cut = (datetime.now(timezone.utc) - timedelta(days=MEDIA_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    n = 0
+    for tb, parent, mark in (("cmedia", "cposts SET mk='expire'", "mk"), ("pmedia", "posts SET has_img=2", "has_img")):
+        k = d.execute(f"SELECT COUNT(*) FROM {tb} WHERE created<?", (cut,)).fetchone()[0]
+        if k:
+            d.execute(f"UPDATE {parent} WHERE id IN (SELECT pid FROM {tb} WHERE created<?)", (cut,))
+            d.execute(f"DELETE FROM {tb} WHERE created<?", (cut,))
+            n += k
+    cap = MEDIA_CAP_MB * 1_000_000
+    for _ in range(500):
+        if media_stats(d)[1] <= cap:
+            break
+        old = d.execute("SELECT t,id,pid FROM (SELECT 'c' t,id,pid,created FROM cmedia UNION ALL SELECT 'p' t,id,pid,created FROM pmedia) x ORDER BY created,id LIMIT 10").fetchall()
+        if not old:
+            break
+        for x in old:
+            if x["t"] == "c":
+                d.execute("UPDATE cposts SET mk='expire' WHERE id=?", (x["pid"],))
+                d.execute("DELETE FROM cmedia WHERE id=?", (x["id"],))
+            else:
+                d.execute("UPDATE posts SET has_img=2 WHERE id=?", (x["pid"],))
+                d.execute("DELETE FROM pmedia WHERE id=?", (x["id"],))
+            n += 1
+            if media_stats(d)[1] <= cap:
+                break
+    return n
+
+
+@app.before_request
+def auto_purge():
+    """Nettoyage automatique, au plus une fois par heure (déclenché par une visite : pas de tâche planifiée à configurer)."""
+    if request.method != "GET" or request.path.startswith("/api/") or not READY["ok"] or time.time() - PURGE["t"] < 3600:
+        return
+    PURGE["t"] = time.time()
+    try:
+        n = purge_media(db())
+        if n:
+            log.info("Nettoyage des médias : %s fichier(s) supprimé(s)", n)
+    except Exception:
+        log.exception("nettoyage des médias")
+
 
 
 def sniff(k, b):
@@ -734,6 +935,9 @@ def community(cid):
                 d.execute("DELETE FROM members WHERE cid=? AND user_id=?", (cid, uid()))
             else:
                 d.execute("INSERT INTO members VALUES(?,?)", (cid, uid()))
+        elif a == "edit" and can_edit_group(c):
+            d.execute("UPDATE communities SET topic=?,descr=? WHERE id=?", (txt(request.form.get("topic"), 40), txt(request.form.get("descr"), 300), cid))
+            flash("Groupe mis à jour ✨", "ok")
         elif a == "post" and joined and throttle(f"cp{uid()}", 30, 300):
             b = txt(request.form.get("body"), 800)
             if b:
@@ -743,7 +947,7 @@ def community(cid):
     mem = d.execute("SELECT u.username FROM members m JOIN users u ON u.id=m.user_id WHERE cid=? LIMIT 12", (cid,)).fetchall()
     nmem = d.execute("SELECT COUNT(*) FROM members WHERE cid=?", (cid,)).fetchone()[0]
     return render_template("community.html", title=c["name"], c=c, joined=joined, posts=posts, more=more, rc=rc, rm=rm, mem=mem,
-                           nmem=nmem, last=posts[-1]["id"] if posts else 0, first=posts[0]["id"] if posts else 0)
+                           nmem=nmem, can_edit=can_edit_group(c), last=posts[-1]["id"] if posts else 0, first=posts[0]["id"] if posts else 0)
 
 
 @app.route("/api/groupe/<int:cid>/fil")
@@ -797,14 +1001,23 @@ def api_gsend(cid):
     return jsonify(ok=True, id=pid)
 
 
-@app.route("/api/groupe/media/<int:pid>")
-def gmedia(pid):
-    r = db().execute("SELECT mime,data FROM cmedia WHERE pid=?", (pid,)).fetchone() or abort(404)
+def serve_media(table, pid):
+    r = db().execute(f"SELECT mime,data FROM {table} WHERE pid=?", (pid,)).fetchone() or abort(404)   # table : valeur interne fixe
     raw = bytes(r["data"])
-    resp = send_file(io.BytesIO(raw), mimetype=r["mime"], conditional=True, etag=f"gm{pid}-{len(raw)}")   # conditional = lecture vidéo/audio par morceaux
+    resp = send_file(io.BytesIO(raw), mimetype=r["mime"], conditional=True, etag=f"{table}{pid}-{len(raw)}")   # conditional = lecture par morceaux
     resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
+
+
+@app.route("/api/groupe/media/<int:pid>")
+def gmedia(pid):
+    return serve_media("cmedia", pid)
+
+
+@app.route("/api/post/media/<int:pid>")
+def post_media(pid):
+    return serve_media("pmedia", pid)
 
 
 @app.route("/api/groupe/reagir/<int:pid>", methods=["POST"])
@@ -860,6 +1073,26 @@ def api_finish():
 
 
 # ───────────────────────────── Profil, messages, notifications ─────────────────────────────
+OTYPES = ["🎭 Cosplayer", "📚 Collectionneur", "📺 Streamer", "✏️ Dessinateur", "📖 Lecteur manga", "🎮 Gamer", "🎵 Mélomane", "🌱 Débutant"]
+BADGES = [  # (emoji, nom, description, clé de stat, seuil)
+    ("✍️", "Plume", "Publier un post", "np", 1), ("📣", "Voix de la commu", "10 posts", "np", 10),
+    ("❤️", "Apprécié", "10 likes reçus", "lk", 10), ("🌟", "Star", "50 likes reçus", "lk", 50),
+    ("💬", "Bavard", "10 commentaires", "nc", 10), ("👥", "Sociable", "Rejoindre un groupe", "ng", 1),
+    ("🤝", "Pilier de groupes", "Rejoindre 3 groupes", "ng", 3), ("⭐", "Collectionneur", "10 séries en favori", "nf", 10),
+    ("🎮", "Quizzeur", "Jouer un quiz", "nq", 1), ("🔥", "Accro au quiz", "10 quiz joués", "nq", 10), ("🧠", "Cerveau", "8/10 au quiz", "best", 8),
+]
+
+
+def user_stats(d, u):
+    i = u["id"]
+    r = d.execute("SELECT (SELECT COUNT(*) FROM posts WHERE user_id=?) np,(SELECT COUNT(*) FROM likes l JOIN posts p ON p.id=l.post_id WHERE p.user_id=?) lk,"
+                  "(SELECT COUNT(*) FROM comments WHERE user_id=?) nc,(SELECT COUNT(*) FROM members WHERE user_id=?) ng,"
+                  "(SELECT COUNT(*) FROM favs WHERE user_id=?) nf,(SELECT COUNT(*) FROM scores WHERE user_id=?) nq,(SELECT COALESCE(MAX(good),0) FROM scores WHERE user_id=?) best",
+                  (i,) * 7).fetchone()
+    stt = dict(r)
+    return stt, [dict(e=e, n=n, d=ds, ok=stt[k] >= t) for e, n, ds, k, t in BADGES]
+
+
 @app.route("/profil/<username>")
 def profile(username):
     d = db()
@@ -870,7 +1103,8 @@ def profile(username):
     posts = d.execute(POSTQ + "WHERE p.user_id=? ORDER BY p.id DESC LIMIT 30", (uid(), u["id"])).fetchall()
     favs = d.execute("SELECT * FROM favs WHERE user_id=? LIMIT 20", (u["id"],)).fetchall()
     st = d.execute("SELECT COUNT(*) n,COALESCE(MAX(good),0) b FROM scores WHERE user_id=?", (u["id"],)).fetchone()
-    return render_template("profile.html", title=username, u=u, locked=False, posts=posts, favs=favs, st=st, own=own)
+    stt, badges = user_stats(d, u)
+    return render_template("profile.html", title=username, u=u, locked=False, posts=posts, favs=favs, st=st, own=own, stt=stt, badges=badges)
 
 
 @app.route("/u/<username>/<kind>")
@@ -931,12 +1165,12 @@ def customize():
         bn = bn if bn in BANNERS or (bn == "img" and u["bv"]) else "sunset"
         col = f.get("color", "")
         col = col.lower() if re.fullmatch(r"#[0-9a-fA-F]{6}", col) else "#ff6a1a"
-        db().execute("UPDATE users SET p_ring=?,p_fx=?,p_name=?,p_banner=?,p_color=?,p_status=? WHERE id=?",
-                     (pick("ring", RINGS, "none"), pick("fx", FXS, "none"), pick("nm", NAMES, "normal"), bn, col, txt(f.get("pstatus"), 60), u["id"]))
+        db().execute("UPDATE users SET p_ring=?,p_fx=?,p_name=?,p_banner=?,p_color=?,p_status=?,otype=? WHERE id=?",
+                     (pick("ring", RINGS, "none"), pick("fx", FXS, "none"), pick("nm", NAMES, "normal"), bn, col, txt(f.get("pstatus"), 60), pick("otype", OTYPES, ""), u["id"]))
         PROFS["t"] = 0
         flash("Profil mis à jour ✨", "ok")
         return redirect("/profil/" + u["username"])
-    return render_template("customize.html", title="Personnaliser", back="/parametres", RINGS=RINGS, FXS=FXS, NAMES=NAMES, BANNERS=BANNERS)
+    return render_template("customize.html", title="Personnaliser", back="/parametres", RINGS=RINGS, FXS=FXS, NAMES=NAMES, BANNERS=BANNERS, OTYPES=OTYPES)
 
 
 @app.route("/messages")
@@ -1211,6 +1445,10 @@ def target_info(kind, i):
     else:
         tb = {"post": "posts", "comment": "comments", "cpost": "cposts"}[kind]
         r = d.execute(f"SELECT t.user_id uid,u.username,t.body FROM {tb} t JOIN users u ON u.id=t.user_id WHERE t.id=?", (i,)).fetchone()
+    if r and kind == "post":
+        hi = d.execute("SELECT has_img FROM posts WHERE id=?", (i,)).fetchone()
+        if hi and hi["has_img"] == 1:
+            r = dict(uid=r["uid"], username=r["username"], body=f"[photo : /api/post/media/{i}] " + (r["body"] or ""))
     if r and kind == "cpost":
         mk = d.execute("SELECT mk FROM cposts WHERE id=?", (i,)).fetchone()
         if mk and mk["mk"]:
@@ -1240,6 +1478,8 @@ def admin():
     meta = dict(storage="PostgreSQL" if PG else "SQLite", durable=DURABLE, since=(d.execute("SELECT MIN(created) FROM users").fetchone()[0] or "")[:10], backup=last_bk,
                 old=(not last_bk) or last_bk < (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"))
     log_rows = d.execute("SELECT l.*,u.username adm FROM admin_log l JOIN users u ON u.id=l.admin_id ORDER BY l.id DESC LIMIT 15").fetchall()
+    files, size = media_stats(d)
+    meta.update(mfiles=files, mmb=round(size / 1e6, 1), dbmb=round(d.execute("SELECT pg_database_size(current_database())").fetchone()[0] / 1e6, 1) if PG else None)
     return render_template("admin.html", title="Modération", tab="reports", stats=stats, rows=rows, log=log_rows, meta=meta)
 
 
@@ -1268,7 +1508,7 @@ def admin_user(i):
 def admin_content():
     d = db()
     get = lambda tb, x="": d.execute(f"SELECT t.id,t.body,t.created{x},u.id uid,u.username FROM {tb} t JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 30").fetchall()
-    return render_template("admin_content.html", title="Contenus", tab="content", posts=get("posts"), comments=get("comments"), cposts=get("cposts", ",t.mk"))
+    return render_template("admin_content.html", title="Contenus", tab="content", posts=get("posts", ",t.has_img"), comments=get("comments"), cposts=get("cposts", ",t.mk"))
 
 
 @app.route("/admin/action", methods=["POST"])
@@ -1313,6 +1553,10 @@ def admin_action():
             PROFS["t"] = 0
             alog("retire photo/bannière", u["username"])
             flash("Photo, bannière et statut retirés.", "ok")
+    elif act == "purge":
+        n = purge_media(d)
+        alog("nettoyage médias", f"{n} fichier(s)")
+        flash(f"{n} média(s) supprimé(s)." if n else "Rien à nettoyer : tout est récent et sous le plafond.", "ok")
     elif act == "delete_content":
         kind = f.get("kind")
         if delete_content(kind, i):
@@ -1626,6 +1870,35 @@ html[data-theme=light] .pill.on{background:#14182b;color:#fff}
 .pbar{position:absolute;left:0;right:0;bottom:0;height:3px}.pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--or),var(--or2));transition:width .15s}
 .rec{display:flex;align-items:center;gap:10px;padding:4px 2px}.rec .dot{width:12px;height:12px;border-radius:50%;background:var(--red);animation:pulse 1s infinite}
 .cbar [hidden]{display:none!important}
+.gone{display:flex;align-items:center;gap:6px;padding:10px 12px;border-radius:12px;background:#0003;color:var(--mut);font-size:.82rem;margin:6px 0}.cm.mine .gone{color:#fff;background:#0002}
+.ptools{display:flex;align-items:center;gap:4px;margin-top:8px}
+.ptools .ib{background:none;color:var(--mut);padding:8px;border-radius:50%;display:inline-flex;cursor:pointer;margin:0}.ptools .ib.on{color:var(--or2);background:var(--card2)}
+.pprev{position:relative;display:inline-block;margin-top:8px}.pprev img{max-height:130px;max-width:100%;border-radius:14px;display:block}
+.pprev button{position:absolute;top:6px;right:6px;width:28px;height:28px;padding:0;border-radius:50%;background:#000b;color:#fff}.pprev[hidden],.ppoll[hidden]{display:none}
+.ppoll{display:grid;gap:6px;margin-top:8px}.ppoll input{margin:0}
+.pimg{display:block;width:100%;max-height:440px;object-fit:cover;border-radius:14px;margin:8px 0;cursor:zoom-in;background:var(--card2)}
+.poll{margin:8px 0}.pos{display:grid;gap:8px;position:relative}
+.po{position:relative;overflow:hidden;display:flex;align-items:center;justify-content:space-between;gap:10px;text-align:left;background:var(--card2);color:var(--text);border:1px solid var(--line);border-radius:14px;padding:12px 14px;font-weight:600;margin:0}
+.po i{position:absolute;left:0;top:0;bottom:0;width:var(--p);background:#ff6a1a33;transition:width .5s;z-index:0}.po span,.po b{position:relative;z-index:1}.po.on{border-color:var(--or2)}.po.on i{background:#ff6a1a66}
+.poll small{display:block;margin-top:6px}
+.poll.vs .pos{grid-template-columns:1fr 1fr}.poll.vs .po{flex-direction:column;justify-content:center;text-align:center;min-height:92px}
+.poll.vs .po i{inset:auto 0 0 0;width:100%;height:var(--p)}
+.poll.vs .pos::after{content:"VS";position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:34px;height:34px;border-radius:50%;background:var(--or);color:#fff;font-weight:900;font-size:.72rem;display:grid;place-items:center;z-index:3;box-shadow:0 4px 14px #0008}
+.gtools{margin:10px 0 4px}.gtools input{margin:0;border-radius:99px;padding-left:18px}
+.gcard{display:flex;align-items:center;gap:12px;padding:12px;margin:10px 0;background:var(--card);border:1px solid var(--line);border-radius:20px;transition:transform .15s}.gcard:active{transform:scale(.98)}.gcard[hidden]{display:none}
+.gcard b{display:block}.gcard small{display:block;color:var(--mut);font-size:.8rem}
+.gav{display:inline-flex;align-items:center;justify-content:center;object-fit:cover;color:#fff;font-weight:800;flex:none}
+.gj{font-size:.76rem;font-weight:700;padding:5px 12px;border-radius:99px;background:#ff6a1a22;color:var(--or2);white-space:nowrap}.gj.o{background:var(--or);color:#fff}
+.fab{position:fixed;right:16px;bottom:calc(96px + env(safe-area-inset-bottom));z-index:35;width:56px;height:56px;border-radius:50%;padding:0;box-shadow:0 8px 24px #ff6a1a66}
+.sheet{position:fixed;inset:0;z-index:90;background:#000a;display:flex;align-items:flex-end;justify-content:center}.sheet[hidden]{display:none}
+.shp{width:100%;max-width:640px;max-height:90vh;overflow:auto;background:var(--card);border-radius:26px 26px 0 0;padding:10px 18px calc(22px + env(safe-area-inset-bottom));animation:up .28s cubic-bezier(.2,.9,.3,1)}@keyframes up{from{transform:translateY(100%)}}
+.grab{display:block;width:44px;height:5px;border-radius:9px;background:var(--line);margin:4px auto 12px}
+.gcover{height:128px;border-radius:0 0 26px 26px;background:linear-gradient(120deg,#ff6a1a,#ff3d71 60%,#6a3dff) center/cover;margin:-4px -16px 0}
+.ghd2{display:flex;align-items:flex-end;gap:12px;margin-top:-34px;padding:0 2px;position:relative}.ghd2 .gav{border:4px solid var(--bg);box-shadow:0 6px 20px #0008}
+.otype{display:inline-block;margin:6px 0 2px;padding:3px 12px;border-radius:99px;background:#ff6a1a22;color:var(--or2);font-weight:700;font-size:.8rem}
+.badges{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:8px;margin-bottom:12px}
+.bdg{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:10px 6px;text-align:center;opacity:.4;filter:grayscale(1)}.bdg.on{opacity:1;filter:none;border-color:#ff6a1a55}
+.bdg span{font-size:1.6rem;display:block}.bdg small{font-size:.68rem;font-weight:700;display:block;margin-top:2px}
 .zoom{position:fixed;inset:0;z-index:100;background:#000e;display:flex;align-items:center;justify-content:center;padding:10px}.zoom img{max-width:100%;max-height:100%;border-radius:8px}
 """
 
@@ -1633,9 +1906,11 @@ html[data-theme=light] .pill.on{background:#14182b;color:#fff}
 POST_MACRO = r"""{% macro flag(kind, id, username) %}{% if me and me.username!=username %}<details class="more"><summary>{{ ic('dots',18) }}</summary><div class="mn" style="top:26px;right:0;min-width:220px"><form method="post" action="/signaler/{{ kind }}/{{ id }}">{{ csrf() }}<select name="reason" style="margin-bottom:6px">{% for r in REASONS %}<option>{{ r }}</option>{% endfor %}</select><button>{{ ic('shield',18) }} Signaler</button></form><form method="post" action="/bloquer/{{ username }}">{{ csrf() }}<button>{{ ic('lock',18) }} Bloquer {{ username }}</button></form></div></details>{% endif %}{% endmacro %}
 {% macro post(p, full=False) %}<article class="post"><div class="ph">{{ ava(p.username,38) }}<div class="grow"><a href="/profil/{{ p.username }}"><b>{{ p.username }}</b></a><small>{{ ago(p.created) }}</small></div>
 {% if me and me.id==p.user_id %}<form method="post" action="/supprimer/post/{{ p.id }}" onsubmit="return confirm('Supprimer ?')">{{ csrf() }}<button class="btn g s">{{ ic('trash',16) }}</button></form>{% else %}{{ flag('post',p.id,p.username) }}{% endif %}</div>
-<p>{{ p.body }}</p>
+{% if p.body %}<p>{{ p.body }}</p>{% endif %}{% if p.has_img==2 %}<div class="gone">📷 Photo expirée (conservée {{ MEDIA_DAYS }} jours)</div>{% endif %}{% if p.has_img==1 %}<img class="pimg" src="/api/post/media/{{ p.id }}?v={{ p.created|replace('-','')|replace(' ','')|replace(':','') }}" alt="Photo" loading="lazy" onclick="zoom(this.src)">{% endif %}{% if p.np %}{{ pollbox(p.id) }}{% endif %}
 {% if p.mal_id %}<a class="att" href="/serie/{{ p.mal_id }}">{% if p.m_img %}<img src="{{ p.m_img }}" loading="lazy" alt="">{% endif %}<div><b>{{ p.m_title }}</b><small class="mut" style="display:block">Voir la fiche →</small></div></a>{% endif %}
 <div class="act"><form method="post" action="/aimer/{{ p.id }}">{{ csrf() }}<button class="{{ 'on' if p.liked }}">{{ ic('heart',19) }} {{ p.lc }}</button></form><a href="/post/{{ p.id }}">{{ ic('msg',19) }} {{ p.cc }}</a></div></article>{% endmacro %}
+{% macro pollbox(pid) %}{% set pl = poll_of(pid) %}{% set show = pl.mine or not me %}<div class="poll{{ ' vs' if pl.opts|length==2 }}" id="poll{{ pid }}"><div class="pos">{% for o in pl.opts %}<button type="button" class="po{{ ' on' if o.id==pl.mine }}" {% if me %}onclick="vote({{ pid }},{{ o.id }})"{% else %}onclick="location.href='/connexion'"{% endif %}><i style="--p:{{ o.pct if show else 0 }}%"></i><span>{{ o.label }}</span>{% if show %}<b>{{ o.pct }}%</b>{% endif %}</button>{% endfor %}</div><small class="mut">{{ pl.total }} vote{{ 's' if pl.total>1 }}{% if me and not pl.mine %} · vote pour voir les résultats{% endif %}</small></div>{% endmacro %}
+{% macro ptools(poll=True) %}<div class="ptools"><label class="ib" title="Ajouter une photo">{{ ic('image',22) }}<input type="file" class="pph" accept="image/*" hidden></label>{% if poll %}<button type="button" class="ib ppb" title="Créer un sondage">{{ ic('chart',22) }}</button>{% endif %}<span class="grow"></span><button class="btn s">Publier</button></div><div class="pprev" hidden></div>{% if poll %}<div class="ppoll" hidden><small class="mut">Écris ta question plus haut, puis 2 à 4 choix (2 choix = duel « versus »).</small><input name="opt" maxlength="40" placeholder="Choix 1"><input name="opt" maxlength="40" placeholder="Choix 2"><input name="opt" maxlength="40" placeholder="Choix 3 (facultatif)"><input name="opt" maxlength="40" placeholder="Choix 4 (facultatif)"></div>{% endif %}{% endmacro %}
 {% macro tiles(data) %}<div class="grid">{% for m in data %}<a class="tile" href="/serie/{{ m.id }}"><img src="{{ m.img }}" loading="lazy" alt="">{% if m.score %}<small>★ {{ m.score }}</small>{% endif %}<b>{{ m.title }}</b></a>{% endfor %}</div>{% if not data %}<p class="mut" style="text-align:center">Aucun résultat — la source (Jikan) est peut-être occupée, réessaie.<br><small>{{ err }}</small> <a href="/diagnostic" style="color:var(--or)">Diagnostic</a></p>{% endif %}{% endmacro %}
 {% macro item(icon, label, sub='', href='') %}{% if href %}<a href="{{ href }}" class="it"><span class="ico">{{ ic(icon,19) }}</span><span class="grow">{{ label }}{% if sub %}<small>{{ sub }}</small>{% endif %}</span>{{ ic('chev',18) }}</a>{% else %}<div class="it"><span class="ico">{{ ic(icon,19) }}</span><span class="grow">{{ label }}{% if sub %}<small>{{ sub }}</small>{% endif %}</span></div>{% endif %}{% endmacro %}
 {% macro sw(name, on, label, sub='', icon='bell') %}<label class="it" style="margin:0"><span class="ico">{{ ic(icon,19) }}</span><span class="grow">{{ label }}{% if sub %}<small>{{ sub }}</small>{% endif %}</span><span class="sw"><input type="checkbox" name="{{ name }}" {{ 'checked' if on }}><i></i></span></label>{% endmacro %}
@@ -1654,14 +1929,37 @@ T["base.html"] = r"""<!doctype html><html lang="fr" data-theme="{{ me.theme if m
 <main>{% if is_admin and not durable %}<a class="flash err" href="/admin" style="display:block">⚠️ Stockage temporaire : les données seront effacées à la prochaine mise à jour. Touche ici pour voir comment corriger.</a>{% endif %}{% for c,m in get_flashed_messages(with_categories=true) %}<div class="flash {{ c }}">{{ m }}</div>{% endfor %}{% block c %}{% endblock %}</main>
 {% if not bare %}<nav class="tabs"><div>{% for h,i,l in [('/','home','Découverte'),('/communautes','users','Groupes'),('/quiz','game','Quiz'),('/catalogue','compass','Catalogue'),('/profil/'+me.username if me else '/connexion','user','Profil')] %}
 <a href="{{ h }}" class="{{ 'on' if (path==h or (h!='/' and path.startswith(h[:6]))) }} {{ 'mid' if i=='game' }}">{{ ic(i) }}{{ l }}</a>{% endfor %}</div></nav>{% endif %}<script>if('serviceWorker' in navigator)addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){})});var DP;addEventListener('beforeinstallprompt',function(e){e.preventDefault();DP=e});
-function installApp(){if(DP){DP.prompt();DP=null}else alert("Menu ⋮ du navigateur → « Installer l'application » ou « Ajouter à l'écran d'accueil ».")}</script></body></html>"""
+function installApp(){if(DP){DP.prompt();DP=null}else alert("Menu ⋮ du navigateur → « Installer l'application » ou « Ajouter à l'écran d'accueil ».")}</script><script>var CSRF="{{ session.get('csrf','') }}";
+function openSheet(i){$(i).hidden=false;document.body.style.overflow='hidden'}
+function closeSheet(e){e.hidden=true;document.body.style.overflow=''}
+addEventListener('keydown',function(e){if(e.key==='Escape')document.querySelectorAll('.sheet').forEach(function(x){if(!x.hidden)closeSheet(x)})});
+function zoom(src){var o=document.createElement('div');o.className='zoom';o.innerHTML='<img src="'+src+'" alt="">';o.onclick=function(){o.remove()};document.body.appendChild(o)}
+function vote(p,o){fetch('/api/sondage/'+p+'/voter',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF':CSRF},body:JSON.stringify({o:o})}).then(function(r){return r.json()}).then(function(d){if(d.ok)$('poll'+p).outerHTML=d.html;else if(d.error)alert(d.error)}).catch(function(){alert('Connexion impossible.')})}
+function crop(file,w,h,max){return new Promise(function(res,rej){var fr=new FileReader();fr.onerror=function(){rej(new Error('Lecture impossible'))};fr.onload=function(){var im=new Image();im.onerror=function(){rej(new Error('Image illisible'))};
+ im.onload=function(){var c=document.createElement('canvas');c.width=w;c.height=h;var x=c.getContext('2d'),r=Math.max(w/im.width,h/im.height),sw=w/r,sh=h/r;x.fillStyle='#000';x.fillRect(0,0,w,h);x.drawImage(im,(im.width-sw)/2,(im.height-sh)/2,sw,sh,0,0,w,h);
+  (function t(q){c.toBlob(function(b){if(!b)return rej(new Error('Conversion impossible'));if(b.size>max&&q>.35)return t(q-.1);b.size>max?rej(new Error('Image trop lourde')):res(b)},'image/jpeg',q)})(.85)};im.src=fr.result};fr.readAsDataURL(file)})}
+(function(){function fit(file,max,lim){return new Promise(function(res,rej){var u=URL.createObjectURL(file),im=new Image();im.onerror=function(){URL.revokeObjectURL(u);rej(new Error('Image illisible.'))};
+ im.onload=function(){URL.revokeObjectURL(u);var r=Math.min(1,max/Math.max(im.width,im.height)),w=Math.round(im.width*r),h=Math.round(im.height*r),c=document.createElement('canvas');c.width=w;c.height=h;var x=c.getContext('2d');x.fillStyle='#000';x.fillRect(0,0,w,h);x.drawImage(im,0,0,w,h);
+  (function t(q){c.toBlob(function(b){if(!b)return rej(new Error('Conversion impossible.'));if(b.size>lim&&q>.4)return t(q-.1);b.size>lim?rej(new Error('Image trop lourde.')):res(b)},'image/jpeg',q)})(.85)};im.src=u})}
+function clr(f){if(f._p){URL.revokeObjectURL(f._p.url);f._p=null}var v=f.querySelector('.pprev');if(v){v.hidden=true;v.innerHTML=''}}
+function setp(f,b,m){clr(f);f._p={blob:b,mime:m,url:URL.createObjectURL(b)};var v=f.querySelector('.pprev');v.innerHTML='<img src="'+f._p.url+'" alt=""><button type="button" aria-label="Retirer">\u2715</button>';v.hidden=false;v.querySelector('button').onclick=function(){clr(f)}}
+document.addEventListener('change',function(e){var i=e.target;if(!i.classList||!i.classList.contains('pph'))return;var f=i.files[0],fm=i.closest('form');i.value='';if(!f)return;
+ if(f.type==='image/gif'&&f.size<=1500000)return setp(fm,f,'image/gif');fit(f,1280,560000).then(function(b){setp(fm,b,'image/jpeg')},function(x){alert(x.message)})});
+document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('.ppb');if(!b)return;var p=b.closest('form').querySelector('.ppoll');p.hidden=!p.hidden;b.classList.toggle('on',!p.hidden)});
+document.addEventListener('submit',function(e){var fm=e.target;if(!fm.classList||!fm.classList.contains('pform')||!fm._p)return;e.preventDefault();
+ var q=new URLSearchParams(),el=fm.elements;q.set('t',(el.body.value||'').trim());['mal_id','m_title','m_img'].forEach(function(n){if(el[n]&&el[n].value)q.set(n,el[n].value)});
+ [].forEach.call(fm.querySelectorAll('[name=opt]'),function(o){if(o.value.trim())q.append('o',o.value.trim())});
+ var bt=fm.querySelector('.ptools .btn');bt.disabled=true;bt.textContent='Envoi\u2026';function back(m){bt.disabled=false;bt.textContent='Publier';alert(m)}
+ var x=new XMLHttpRequest();x.open('POST','/api/publier?'+q.toString());x.setRequestHeader('Content-Type',fm._p.mime);x.setRequestHeader('X-CSRF',CSRF);
+ x.onload=function(){var d={};try{d=JSON.parse(x.responseText)}catch(_){}if(d.ok)location.reload();else back(d.error||'Envoi impossible.')};x.onerror=function(){back('Connexion impossible.')};x.send(fm._p.blob)})})();
+</script></body></html>"""
 
-T["home.html"] = r"""{% extends "base.html" %}{% from "m.html" import post, cd with context %}{% block c %}
+T["home.html"] = r"""{% extends "base.html" %}{% from "m.html" import post, cd, ptools with context %}{% block c %}
 <div class="hero">L'univers<em>Otaku</em>autrement.</div>
 <div class="stories" id="stories"></div>
 <div class="pills"><a class="pill {{ 'on' if tab=='decouverte' }}" href="/">{{ ic('compass',16) }} Découverte</a><a class="pill {{ 'on' if tab=='suivis' }}" href="/?t=suivis">{{ ic('star',16) }} Mes séries</a><a class="pill" href="/catalogue?t=planning">{{ ic('home',16) }} Planning</a><a class="pill" href="/quiz">{{ ic('game',16) }} Quiz</a></div>
 <a class="promo" href="/quiz"><span class="lg">TKN</span><span><b>Le prochain tournoi solo arrive bientôt</b><small>Démarrage dans {{ (eta//3600) }}h {{ (eta%3600//60) }}m — 10 questions, 15 s chacune</small></span></a>
-{% if me %}<form method="post" action="/publier" class="card">{{ csrf() }}<div class="row">{{ ava(me.username,36) }}<textarea name="body" maxlength="1000" placeholder="Partage ton avis, un spoiler (avec précaution)…" style="min-height:52px"></textarea></div><div style="text-align:right;margin-top:8px"><button class="btn s">Publier</button></div></form>
+{% if me %}<form method="post" action="/publier" class="card pform">{{ csrf() }}<div class="row">{{ ava(me.username,36) }}<textarea name="body" maxlength="1000" placeholder="Partage ton avis, un spoiler (avec précaution)…" style="min-height:52px"></textarea></div>{{ ptools() }}</form>
 {% else %}<div class="card" style="text-align:center">Rejoins la communauté pour publier et jouer.<br><a class="btn s" style="margin-top:8px" href="/inscription">Créer un compte</a></div>{% endif %}
 {% if watch %}<h2>Tes prochains épisodes</h2><div class="stories" id="nxt">{{ '' }}</div><script>$('nxt').innerHTML=skC(4);NX({{ watch|tojson }}).then(function(o){var a=Object.keys(o).map(function(k){return Object.assign({id:k},o[k])}).sort(function(x,y){return x.at-y.at});
 $('nxt').innerHTML=a.length?a.map(function(m){return'<a class="st" style="width:104px" href="/serie/'+m.id+'"><img src="'+esc(m.img)+'" alt="" loading="lazy" style="border-radius:14px;aspect-ratio:2/3;border:0;object-fit:cover;width:100%"><span><b style="color:var(--or2)">Ép. '+m.ep+'</b> · '+dur(m.at-Date.now()/1000)+'</span></a>'}).join(''):'<p class="mut" style="font-size:.85rem">Aucun épisode à venir pour tes séries.</p>'}).catch(function(e){fail($('nxt'),e)})</script>{% endif %}
@@ -1699,7 +1997,7 @@ function more(){if(busy||done)return;busy=1;O.page=pg;L(K,O).then(function(l){if
  .catch(function(e){if(pg==1)fail(G,e);done=1;busy=0;$('mo').hidden=true})}
 if('IntersectionObserver' in window)new IntersectionObserver(function(e){if(e[0].isIntersecting)more()},{rootMargin:'500px'}).observe($('mo'));more();</script>{% endblock %}"""
 
-T["media.html"] = r"""{% extends "base.html" %}{% from "m.html" import post with context %}{% block c %}
+T["media.html"] = r"""{% extends "base.html" %}{% from "m.html" import post, ptools with context %}{% block c %}
 <div id="info"><div class="sk" style="height:190px"></div></div>
 <p id="nxe" style="color:var(--or2);font-weight:700;margin:10px 0 0"></p>
 {% if me %}<form method="post" action="/liste/{{ mid }}" class="card">{{ csrf() }}<input type="hidden" name="title" id="ft"><input type="hidden" name="img" id="fi"><input type="hidden" name="total" id="fe"><input type="hidden" name="kind" value="{{ k }}">
@@ -1710,7 +2008,7 @@ T["media.html"] = r"""{% extends "base.html" %}{% from "m.html" import post with
 <a id="tr" class="btn g w" target="_blank" rel="noopener" style="margin-top:8px" hidden>Bande-annonce</a>
 <div class="card"><p id="syn" style="margin:0;white-space:pre-wrap" class="mut">Chargement…</p></div>
 <div id="chars"></div>
-<h2>En parler</h2>{% if me %}<form method="post" action="/publier" class="card">{{ csrf() }}<input type="hidden" name="mal_id" value="{{ mid }}"><input type="hidden" name="m_title" id="pt"><input type="hidden" name="m_img" id="pi"><textarea name="body" placeholder="Ton avis…" maxlength="1000"></textarea><div style="text-align:right;margin-top:8px"><button class="btn s">Publier</button></div></form>{% endif %}
+<h2>En parler</h2>{% if me %}<form method="post" action="/publier" class="card pform">{{ csrf() }}<input type="hidden" name="mal_id" value="{{ mid }}"><input type="hidden" name="m_title" id="pt"><input type="hidden" name="m_img" id="pi"><textarea name="body" placeholder="Ton avis…" maxlength="1000"></textarea>{{ ptools() }}</form>{% endif %}
 {% for p in posts %}{{ post(p) }}{% endfor %}
 <script>M({{ mid }},'{{ k }}').then(function(m){document.title=m.title+' · SenpaiX';
 $('info').innerHTML='<div class="row" style="align-items:flex-start"><img src="'+esc(m.img)+'" alt="" style="width:130px;border-radius:16px"><div class="grow"><h1 style="font-size:1.2rem">'+esc(m.title)+'</h1><p class="mut" style="margin:0 0 8px">'+esc(m.type||'')+' · '+(m.year||'?')+' · '+(m.eps||'?')+' ép./ch.<br>'+esc(m.genres)+(m.studio?'<br>'+esc(m.studio):'')+'</p>'+(m.score?'<b style="color:var(--or2)">★ '+m.score+'</b>':'')+'</div></div>';
@@ -1725,28 +2023,36 @@ T["post.html"] = r"""{% extends "base.html" %}{% from "m.html" import post, flag
 {% if me %}<form method="post" class="row" style="margin-top:12px">{{ csrf() }}<input name="body" maxlength="500" placeholder="Ajouter un commentaire…" required><button class="btn">{{ ic('send',18) }}</button></form>{% endif %}{% endblock %}"""
 
 T["communities.html"] = r"""{% extends "base.html" %}{% block c %}<div class="hero" style="font-size:1.7rem">Rencontre des groupes de<em style="font-size:2rem">passionnés !</em></div>
-{% for c in rows %}<a class="card row" href="/communaute/{{ c.id }}"><span class="ava" style="width:46px;height:46px;background:linear-gradient(135deg,var(--or),#ff3d71);font-size:1.2rem">{{ c.name[:1]|upper }}</span><div class="grow"><b>{{ c.name }}</b><small class="mut" style="display:block">{{ c.topic }} · {{ c.n }} membre{{ 's' if c.n>1 }}{% if c.la %} · 💬 {{ ago(c.la) }}{% endif %}</small></div>{% if c.joined %}<small style="color:var(--or)">Membre</small>{% endif %}</a>
-{% else %}<p class="mut" style="text-align:center">Aucun groupe. Crée le premier !</p>{% endfor %}
-{% if me %}<h2>Créer un groupe</h2><form method="post" class="card">{{ csrf() }}<label>Nom</label><input name="name" maxlength="40" required><label>Thème (ex : One Piece)</label><input name="topic" maxlength="40"><label>Description</label><textarea name="descr" maxlength="300"></textarea><p><button class="btn w">Créer</button></p></form>{% endif %}{% endblock %}"""
+<div class="gtools"><input id="gq" type="search" placeholder="Rechercher un groupe…" autocomplete="off"></div>
+<div class="pills"><a class="pill on" href="#" data-f="all">Tous</a>{% if me %}<a class="pill" href="#" data-f="mine">{{ ic('users',16) }} Mes groupes</a>{% endif %}</div>
+<div id="glist">{% for c in rows %}<a class="gcard" href="/communaute/{{ c.id }}" data-q="{{ (c.name ~ ' ' ~ c.topic)|lower }}" data-j="{{ 1 if c.joined else 0 }}">{{ gav(c,56) }}<div class="grow" style="min-width:0"><b>{{ c.name }}</b>{% if c.topic %}<small>{{ c.topic }}</small>{% endif %}<small>👥 {{ c.n }} membre{{ 's' if c.n>1 }}{% if c.la %} · 💬 {{ ago(c.la) }}{% endif %}</small></div>{% if c.joined %}<span class="gj">Membre</span>{% else %}<span class="gj o">Voir</span>{% endif %}</a>
+{% else %}<p class="mut" style="text-align:center">Aucun groupe. Crée le premier !</p>{% endfor %}</div>
+<p id="gnone" class="mut" style="text-align:center" hidden>Aucun groupe ne correspond.</p>
+{% if me %}<button class="btn fab" aria-label="Créer un groupe" onclick="openSheet('nsheet')">{{ ic('plus',26) }}</button>
+<div class="sheet" id="nsheet" hidden onclick="if(event.target===this)closeSheet(this)"><div class="shp"><i class="grab"></i><h2 style="margin:0 0 4px">Créer un groupe</h2><p class="mut" style="margin:0 0 8px">Tu pourras ajouter une photo et une bannière ensuite.</p><form method="post">{{ csrf() }}<label>Nom</label><input name="name" maxlength="40" required><label>Thème (ex : One Piece)</label><input name="topic" maxlength="40"><label>Description</label><textarea name="descr" maxlength="300" style="min-height:84px"></textarea><p><button class="btn w">Créer le groupe</button></p></form></div></div>{% endif %}
+<script>(function(){var f='all',q=$('gq');function run(){var v=q.value.trim().toLowerCase(),n=0;document.querySelectorAll('#glist .gcard').forEach(function(c){var ok=(!v||c.dataset.q.indexOf(v)>-1)&&(f=='all'||c.dataset.j=='1');c.hidden=!ok;if(ok)n++});$('gnone').hidden=n>0}
+q.oninput=run;document.querySelectorAll('.pills [data-f]').forEach(function(b){b.onclick=function(e){e.preventDefault();f=b.dataset.f;document.querySelectorAll('.pills [data-f]').forEach(function(x){x.classList.toggle('on',x==b)});run()}})})()</script>{% endblock %}"""
 
 T["c.html"] = r"""{% macro rxbar(pid, counts, mine, joined) %}{% for e,n in counts %}<button type="button" class="rch{{ ' on' if e==mine }}" {% if joined %}onclick="react({{ pid }},'{{ e }}')"{% else %}disabled{% endif %}>{{ e }} <b>{{ n }}</b></button>{% endfor %}{% if joined %}<details class="rpk"><summary>{{ ic('smile',16) }}</summary><div class="rrow">{% for e in REACTS %}<button type="button" onclick="react({{ pid }},'{{ e }}')">{{ e }}</button>{% endfor %}</div></details>{% endif %}{% endmacro %}
 {% macro cmsg(p, rc, rm, joined) %}{% set mine = me and me.id==p.user_id %}{% set src = '/api/groupe/media/' ~ p.id ~ '?v=' ~ (p.created|replace('-','')|replace(' ','')|replace(':','')) %}
 <div class="cm{{ ' mine' if mine }}" id="m{{ p.id }}" data-id="{{ p.id }}">{% if not mine %}<a href="/profil/{{ p.username }}">{{ ava(p.username,32) }}</a>{% endif %}<div class="cb">{% if not mine %}<a class="cn" href="/profil/{{ p.username }}">{{ p.username }}</a>{% endif %}
-{% if p.mk=='image' %}<img class="cimg" src="{{ src }}" alt="Photo" loading="lazy" onclick="zoom(this.src)">{% elif p.mk=='video' %}<video class="cvid" src="{{ src }}#t=0.1" controls playsinline preload="metadata"></video>{% elif p.mk=='audio' %}<audio class="caud" src="{{ src }}" controls preload="none"></audio>{% endif %}
+{% if p.mk=='image' %}<img class="cimg" src="{{ src }}" alt="Photo" loading="lazy" onclick="zoom(this.src)">{% elif p.mk=='video' %}<video class="cvid" src="{{ src }}#t=0.1" controls playsinline preload="metadata"></video>{% elif p.mk=='audio' %}<audio class="caud" src="{{ src }}" controls preload="none"></audio>{% elif p.mk=='expire' %}<div class="gone">📎 Média expiré (conservé {{ MEDIA_DAYS }} jours)</div>{% endif %}
 {% if p.body %}<p>{{ p.body }}</p>{% endif %}
 <div class="cf"><small>{{ ago(p.created) }}</small><div class="rx" id="rx{{ p.id }}">{{ rxbar(p.id, rc.get(p.id,[]), rm.get(p.id,''), joined) }}</div>
 {% if me %}<details class="more cmore"><summary>{{ ic('dots',16) }}</summary><div class="mn cmn">{% if mine %}<form method="post" action="/supprimer/cpost/{{ p.id }}" onsubmit="return confirm('Supprimer ce message ?')">{{ csrf() }}<button>{{ ic('trash',18) }} Supprimer</button></form>{% else %}<form method="post" action="/signaler/cpost/{{ p.id }}">{{ csrf() }}<select name="reason" style="margin-bottom:6px">{% for r in REASONS %}<option>{{ r }}</option>{% endfor %}</select><button>{{ ic('shield',18) }} Signaler</button></form><form method="post" action="/bloquer/{{ p.username }}">{{ csrf() }}<button>{{ ic('lock',18) }} Bloquer {{ p.username }}</button></form>{% endif %}</div></details>{% endif %}</div></div></div>{% endmacro %}"""
 T["cfeed.html"] = r"""{% from "c.html" import cmsg with context %}{% for p in posts %}{{ cmsg(p, rc, rm, joined) }}{% endfor %}"""
+T["pollx.html"] = r"""{% from "m.html" import pollbox with context %}{{ pollbox(pid) }}"""
 T["crx.html"] = r"""{% from "c.html" import rxbar with context %}{{ rxbar(pid, counts, mine, True) }}"""
 
 T["community.html"] = r"""{% extends "base.html" %}{% set back='/communautes' %}{% block c %}
 {% if joined %}<style>.tabs{display:none}</style>{% endif %}
-<div class="ghd"><span class="ava" style="width:52px;height:52px;background:linear-gradient(135deg,var(--or),#ff3d71);font-size:1.4rem">{{ c.name[:1]|upper }}</span><div class="grow"><h1 style="margin:0;font-size:1.25rem">{{ c.name }}</h1><small class="mut">{% if c.topic %}{{ c.topic }} · {% endif %}{{ nmem }} membre{{ 's' if nmem>1 }}</small></div>
+<div class="gcover" {% if c.cv %}style="background-image:url(/g/{{ c.id }}/cover?v={{ c.cv }})"{% endif %}></div>
+<div class="ghd2">{{ gav(c,84) }}<div class="grow" style="min-width:0;padding-bottom:4px"><h1 style="margin:0;font-size:1.3rem">{{ c.name }}</h1><small class="mut">{% if c.topic %}{{ c.topic }} · {% endif %}{{ nmem }} membre{{ 's' if nmem>1 }}</small></div></div>
+{% if c.descr %}<p class="mut" style="margin:10px 2px 0">{{ c.descr }}</p>{% endif %}<small class="mut" style="display:block;margin:6px 2px 0">📎 Photos, vidéos et vocaux conservés {{ MEDIA_DAYS }} jours</small>
+<div class="row" style="margin:12px 0 4px;flex-wrap:wrap">{% if me and not joined %}<form method="post" style="flex:1 1 200px">{{ csrf() }}<input type="hidden" name="action" value="join"><button class="btn w" style="white-space:nowrap">Rejoindre le groupe</button></form>{% elif joined %}<span class="gj" style="padding:9px 16px">✓ Membre</span>{% elif not me %}<a class="btn grow" href="/connexion?next=/communaute/{{ c.id }}" style="text-align:center">Connecte-toi pour participer</a>{% endif %}
+{% if can_edit %}<button type="button" class="btn s g" onclick="openSheet('esheet')">{{ ic('edit',16) }} Personnaliser</button>{% endif %}<span class="grow"></span>
 {% if joined %}<details class="more"><summary>{{ ic('dots',22) }}</summary><div class="mn"><form method="post">{{ csrf() }}<input type="hidden" name="action" value="join"><button onclick="return confirm('Quitter le groupe ?')">{{ ic('out',18) }} Quitter le groupe</button></form></div></details>{% endif %}</div>
-{% if c.descr %}<p class="mut" style="margin:6px 0 10px">{{ c.descr }}</p>{% endif %}
-<div class="row" style="margin-bottom:10px">{% for m in mem %}<a href="/profil/{{ m.username }}">{{ ava(m.username,30) }}</a>{% endfor %}</div>
-{% if me and not joined %}<form method="post">{{ csrf() }}<input type="hidden" name="action" value="join"><button class="btn w">Rejoindre pour écrire, envoyer photos et vidéos</button></form>
-{% elif not me %}<a class="btn w" href="/connexion?next=/communaute/{{ c.id }}">Connecte-toi pour participer</a>{% endif %}
+<div class="row" style="margin:8px 0 10px">{% for m in mem %}<a href="/profil/{{ m.username }}">{{ ava(m.username,30) }}</a>{% endfor %}</div>
 {% if more %}<p style="text-align:center"><button type="button" class="btn g s" id="older">Messages plus anciens</button></p>{% endif %}
 <div id="msgs">{% include "cfeed.html" %}</div>
 <p id="empty" class="mut" style="text-align:center;margin:30px 0" {% if posts %}hidden{% endif %}>Aucun message pour le moment. Lance la conversation !</p>
@@ -1814,7 +2120,14 @@ window.zoom=function(src){var o=document.createElement('div');o.className='zoom'
 var ol=$('older');if(ol)ol.onclick=function(){var b=this;fetch('/api/groupe/'+CID+'/fil?avant='+first,{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){
  var h=document.documentElement,old=h.scrollHeight;put(d.html,true);if(d.first)first=d.first;window.scrollTo(0,window.scrollY+h.scrollHeight-old);if(!d.more)b.parentNode.remove()}).catch(function(){err('Chargement impossible.')})};
 pad();down(false);addEventListener('resize',pad);
-})()</script>{% endif %}{% endblock %}"""
+})()</script>{% endif %}
+{% if can_edit %}<div class="sheet" id="esheet" hidden onclick="if(event.target===this)closeSheet(this)"><div class="shp"><i class="grab"></i><h2 style="margin:0 0 10px">Personnaliser le groupe</h2>
+<div class="row" style="flex-wrap:wrap;margin-bottom:6px"><button type="button" class="btn s" onclick="$('gfa').click()">{{ ic('image',16) }} Photo du groupe</button><button type="button" class="btn s g" onclick="$('gfc').click()">{{ ic('image',16) }} Bannière</button></div>
+<input type="file" id="gfa" accept="image/*" hidden><input type="file" id="gfc" accept="image/*" hidden><small id="gum" class="mut" style="display:block;min-height:1.2em">Les images sont recadrées et réduites automatiquement.</small>
+{% if c.av or c.cv %}<div class="row" style="flex-wrap:wrap;margin:6px 0">{% if c.av %}<form method="post" action="/groupe/{{ c.id }}/photo/supprimer">{{ csrf() }}<input type="hidden" name="kind" value="avatar"><button class="btn s g" onclick="return confirm('Retirer la photo ?')">Retirer la photo</button></form>{% endif %}{% if c.cv %}<form method="post" action="/groupe/{{ c.id }}/photo/supprimer">{{ csrf() }}<input type="hidden" name="kind" value="cover"><button class="btn s g" onclick="return confirm('Retirer la bannière ?')">Retirer la bannière</button></form>{% endif %}</div>{% endif %}
+<form method="post">{{ csrf() }}<input type="hidden" name="action" value="edit"><label>Thème</label><input name="topic" maxlength="40" value="{{ c.topic }}"><label>Description</label><textarea name="descr" maxlength="300" style="min-height:84px">{{ c.descr }}</textarea><p><button class="btn w">Enregistrer</button></p></form></div></div>
+<script>(function(){function gup(k,f){if(!f)return;$('gum').textContent='Envoi en cours…';var av=k=='avatar';crop(f,av?256:960,av?256:360,av?68000:165000).then(function(b){return fetch('/api/groupe/{{ c.id }}/img/'+k,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'image/jpeg','X-CSRF':CSRF},body:b})}).then(function(r){return r.json()}).then(function(d){if(d.error)throw new Error(d.error);location.reload()}).catch(function(e){$('gum').textContent='⚠️ '+e.message})}
+$('gfa').onchange=function(){var f=this.files[0];this.value='';gup('avatar',f)};$('gfc').onchange=function(){var f=this.files[0];this.value='';gup('cover',f)}})()</script>{% endif %}{% endblock %}"""
 
 T["quiz.html"] = r"""{% extends "base.html" %}{% from "m.html" import cd with context %}{% block c %}
 <div id="home"><h1>Tournoi</h1><div class="card" style="text-align:center"><small class="mut">Début dans :</small>{{ cd(eta) }}
@@ -1846,10 +2159,12 @@ function next(){i++;if(i<Q.length)return show();$('game').hidden=true;$('end').h
 T["profile.html"] = r"""{% extends "base.html" %}{% from "m.html" import post with context %}{% block c %}
 {% set bk = u.p_banner if (u.p_banner!='img' or u.bv) else 'sunset' %}
 <div class="pcard" style="--c:{{ u.p_color or '#ff6a1a' }}"><div class="pbanner bn-{{ bk }}" {% if bk=='img' %}style="background-image:url(/u/{{ u.username }}/banner?v={{ u.bv }})"{% endif %}><div class="fxbox" id="fxb" data-fx="{{ u.p_fx or 'none' }}"></div></div>
-<div class="pmeta">{{ ava(u.username,92) }}<br><h1 class="nm nm-{{ u.p_name or 'normal' }}">{{ u.username }}</h1>{% if u.p_status and not locked %}<br><span class="pstatus">{{ u.p_status }}</span>{% endif %}<br><small class="mut">Membre depuis {{ u.created[:10] }}</small>{% if not locked %}<p>{{ u.bio }}</p>{% endif %}
+<div class="pmeta">{{ ava(u.username,92) }}<br><h1 class="nm nm-{{ u.p_name or 'normal' }}">{{ u.username }}</h1>{% if u.otype and not locked %}<br><span class="otype">{{ u.otype }}</span>{% endif %}{% if u.p_status and not locked %}<br><span class="pstatus">{{ u.p_status }}</span>{% endif %}<br><small class="mut">Membre depuis {{ u.created[:10] }}</small>{% if not locked %}<p>{{ u.bio }}</p>{% endif %}
 {% if me and not own %}<a class="btn s" href="/messages/{{ u.username }}">{{ ic('msg',16) }} Message</a> <form method="post" action="/bloquer/{{ u.username }}" style="display:inline">{{ csrf() }}<button class="btn s g">Bloquer</button></form> <form method="post" action="/signaler/user/{{ u.id }}" style="display:inline">{{ csrf() }}<input type="hidden" name="reason" value="Contenu inapproprié"><button class="btn s g">Signaler</button></form>{% elif own %}<a class="btn s" href="/profil/modifier">✨ Personnaliser</a> <a class="btn s g" href="/parametres">{{ ic('sliders',16) }} Paramètres</a>{% endif %}</div></div>
 {% if locked %}<div class="card" style="text-align:center;margin-top:14px">{{ ic('lock') }} Ce profil est privé.</div>{% else %}
-<div class="kpi" style="margin:14px 0"><div><b>{{ posts|length }}</b><small>Posts</small></div><div><b>{{ favs|length }}</b><small>Favoris</small></div><div><b>{{ st.b }}/10</b><small>Meilleur quiz</small></div></div>
+<div class="kpi" style="margin:14px 0 8px"><div><b>{{ stt.np }}</b><small>Posts</small></div><div><b>{{ favs|length }}</b><small>Favoris</small></div><div><b>{{ st.b }}/10</b><small>Meilleur quiz</small></div></div>
+<div class="kpi" style="margin:0 0 14px"><div><b>{{ stt.lk }}</b><small>Likes reçus</small></div><div><b>{{ stt.ng }}</b><small>Groupes</small></div><div><b>{{ stt.nq }}</b><small>Quiz joués</small></div></div>
+<h2>Badges <small class="mut" style="font-weight:400">{{ badges|selectattr('ok')|list|length }}/{{ badges|length }}</small></h2><div class="badges">{% for b in badges %}<div class="bdg{{ ' on' if b.ok }}" title="{{ b.d }}"><span>{{ b.e }}</span><small>{{ b.n }}</small></div>{% endfor %}</div>
 {% if favs %}<h2>Séries favorites</h2><div class="stories">{% for f in favs %}<a class="st" style="width:90px" href="/serie/{{ f.mal_id }}{{ '?k=manga' if f.kind=='manga' }}"><img src="{{ f.img }}" alt="" style="border-radius:14px;aspect-ratio:2/3;border:0"><span>{{ f.title }}</span></a>{% endfor %}</div>{% endif %}
 <h2>Publications</h2>{% for p in posts %}{{ post(p) }}{% else %}<p class="mut">Rien pour l'instant.</p>{% endfor %}{% endif %}
 <script>fx($('fxb'),$('fxb').dataset.fx)</script>{% endblock %}"""
@@ -1881,7 +2196,7 @@ T["settings.html"] = r"""{% extends "base.html" %}{% from "m.html" import item, 
 <div class="sec">Mes données</div><div class="grp"><form method="post" action="/export">{{ csrf() }}<button class="it"><span class="ico">{{ ic('dl',19) }}</span><span class="grow">Exporter mes données (JSON)</span></button></form></div>
 <div class="grp"><form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button class="it"><span class="ico">{{ ic('out',19) }}</span><span class="grow">Se déconnecter</span></button></form></div>
 <div class="sec" style="color:#ff6b81">Zone dangereuse</div><div class="grp" style="padding:12px 16px"><form method="post" onsubmit="return confirm('Supprimer définitivement ?')">{{ csrf() }}<input type="hidden" name="action" value="delete"><small class="mut">Irréversible. Tape ton pseudo et ton mot de passe.</small><input name="confirm" placeholder="Ton pseudo" style="margin:8px 0"><input type="password" name="password" placeholder="Mot de passe"><p><button class="btn s r">Supprimer mon compte</button></p></form></div>
-<p class="mut" style="text-align:center;font-size:.72rem">SenpaiX v4 · Jikan + AniList</p><div style="margin-top: 15px; text-align: center;"><a href="https://pubads.g.doubleclick.net/gampad/ads..." target="_blank" style="font-size: 0.75rem; color: var(--mut);">Publicité - Google AdSense</a></div>{% endblock %}"""
+<p class="mut" style="text-align:center;font-size:.72rem">SenpaiX v4 · Jikan + AniList</p>{% endblock %}"""
 
 T["auth.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><div class="logo" style="font-size:2.6rem">Senpai<b>X</b></div><p class="mut" style="margin:4px 0 14px">L'univers Otaku autrement.</p>
 <div class="seg"><a class="{{ '' if reg else 'on' }}" href="/connexion">Connexion</a><a class="{{ 'on' if reg }}" href="/inscription">Inscription</a></div>
@@ -1907,7 +2222,7 @@ $('p2').oninput=function(){var o=$('p2m');if(!this.value){o.textContent='';retur
 
 T["about.html"] = r"""{% extends "base.html" %}{% block c %}<h1>À propos</h1><div class="card"><div class="row">{{ ava(creator,56) }}<div><b>{{ creator }}</b><small class="mut" style="display:block">Créateur · Guinée 🇬🇳</small></div></div><p>{{ bio }}</p></div>
 <div class="grp"><a class="it" href="mailto:{{ email }}"><span class="ico">{{ ic('mail',19) }}</span><span class="grow">{{ email }}</span></a><a class="it" href="https://wa.me/{{ wa }}"><span class="ico">{{ ic('msg',19) }}</span><span class="grow">WhatsApp {{ wa_show }}</span></a><a class="it" href="{{ fb }}"><span class="ico">{{ ic('users',19) }}</span><span class="grow">Facebook</span></a></div>
-<p class="mut" style="font-size:.8rem">Sources des données : Jikan (MyAnimeList) et AniList. Publicité Google AdSense intégrée.</p>{% endblock %}"""
+<p class="mut" style="font-size:.8rem">Sources des données : Jikan (MyAnimeList) et AniList. Aucune publicité.</p>{% endblock %}"""
 
 T["diag.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Diagnostic</h1><p class="mut">Test des sources depuis ton navigateur.</p>
 <div class="grp"><div class="it"><span class="grow">Internet<small id="d0">…</small></span></div><div class="it"><span class="grow">AniList<small id="d1">…</small></span></div><div class="it"><span class="grow">Jikan (MyAnimeList)<small id="d2">…</small></span></div></div>
@@ -1928,11 +2243,11 @@ T["forgot.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><
 
 T["priv.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Politique de confidentialité</h1><p class="mut">Dernière mise à jour : 24 octobre 2026</p>
 <div class="card"><h2>Qui sommes-nous ?</h2><p>SenpaiX est un réseau social pour fans de mangas et d'animés, créé et géré par {{ creator }} (Guinée). Contact : <a href="mailto:{{ email }}" style="color:var(--or)">{{ email }}</a>.</p>
-<h2>Données que nous collectons</h2><p>• <b>Compte</b> : pseudo, mot de passe (stocké uniquement sous forme chiffrée/hachée, nous ne pouvons pas le lire), e-mail (facultatif), code de récupération (haché).<br>• <b>Contenu</b> : ta photo de profil et ta bannière (réduites puis stockées dans notre base de données), tes publications, commentaires, messages privés, favoris, groupes rejoints et scores de quiz.<br>• <b>Technique</b> : un cookie de session indispensable à ta connexion. Intégration de bannières publicitaires Google AdSense.</p>
+<h2>Données que nous collectons</h2><p>• <b>Compte</b> : pseudo, mot de passe (stocké uniquement sous forme chiffrée/hachée, nous ne pouvons pas le lire), e-mail (facultatif), code de récupération (haché).<br>• <b>Contenu</b> : ta photo de profil et ta bannière (réduites puis stockées dans notre base de données), tes publications, commentaires, messages privés, favoris, groupes rejoints et scores de quiz.<br>• <b>Technique</b> : un cookie de session indispensable à ta connexion. Pas de pistage publicitaire, pas de cookies marketing.</p>
 <h2>Pourquoi ?</h2><p>Uniquement pour faire fonctionner l'application : te connecter, afficher ton profil et tes publications, gérer les messages, notifications, classements et favoris.</p>
 <h2>Services tiers</h2><p>Les fiches, affiches et tendances viennent de <b>AniList</b> et de <b>Jikan / MyAnimeList</b>. Quand tu les consultes, ton navigateur contacte directement ces services : ils peuvent voir ton adresse IP, selon leurs propres politiques. Nous ne leur envoyons ni ton pseudo ni tes données de compte. Ton navigateur garde aussi un cache local (catalogue) pour aller plus vite.</p>
 <h2>Modération</h2><p>Les modérateurs peuvent consulter les contenus publics (publications, commentaires, messages de groupe) et les signalements pour faire respecter les conditions. Ils ne lisent pas tes messages privés.</p>
-<h2>Partage</h2><p>Nous ne vendons ni ne louons tes données et affichons des publicités légères (Google AdSense). Tes publications sont visibles des autres membres ; un profil « privé » masque ton profil. Les messages privés ne sont visibles que des deux personnes. Nous pouvons divulguer des informations si la loi l'exige.</p>
+<h2>Partage</h2><p>Nous ne vendons ni ne louons tes données et n'affichons aucune publicité. Tes publications sont visibles des autres membres ; un profil « privé » masque ton profil. Les messages privés ne sont visibles que des deux personnes. Nous pouvons divulguer des informations si la loi l'exige.</p>
 <h2>Conservation et sécurité</h2><p>Tes données sont conservées tant que ton compte existe. Les mots de passe sont hachés, les formulaires protégés contre les attaques CSRF, les tentatives de connexion limitées. Aucun système n'est infaillible : choisis un mot de passe unique et solide.</p>
 <h2>Tes droits</h2><p>Dans <b>Paramètres</b> tu peux : modifier ton profil et ton e-mail, <b>exporter</b> tes données (JSON) et <b>supprimer définitivement</b> ton compte (tout ton contenu est effacé). Pour toute autre demande, écris-nous.</p>
 <h2>Mineurs</h2><p>SenpaiX est réservé aux personnes de 13 ans et plus. Si tu penses qu'un enfant plus jeune a un compte, préviens-nous pour qu'il soit supprimé.</p>
@@ -1967,10 +2282,13 @@ T["adm.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Modération</h1>
 T["admin.html"] = r"""{% extends "adm.html" %}{% block a %}
 <div class="card" style="border-color:{{ '#2e8b57' if meta.durable else '#e5233b' }}"><b>{{ '✅' if meta.durable else '⚠️' }} Stockage : {{ meta.storage }}{{ ' (permanent)' if meta.durable and meta.storage=='PostgreSQL' else '' }}</b>
 <small class="mut" style="display:block;margin-top:4px">{% if meta.durable %}Les données sont conservées après chaque mise à jour du code.{% else %}Stockage TEMPORAIRE : tout sera effacé à chaque mise à jour ou mise en veille. Dans Render &gt; Environment, ajoute la variable DATABASE_URL (adresse Postgres de Neon), puis redéploie.{% endif %}<br>Premier membre inscrit le {{ meta.since or '—' }} · Dernière sauvegarde : {{ meta.backup[:10] if meta.backup else 'jamais' }}{% if meta.old %} — <a href="/admin/export" style="color:var(--or)">faire une sauvegarde</a>{% endif %}</small></div>
+<div class="card"><b>🗂️ Médias : {{ meta.mmb }} Mo · {{ meta.mfiles }} fichier{{ 's' if meta.mfiles>1 }}</b>{% if meta.dbmb %}<small class="mut" style="display:block;margin-top:4px">Base de données entière : {{ meta.dbmb }} Mo</small>{% endif %}
+<small class="mut" style="display:block;margin-top:4px">Les photos, vidéos et vocaux sont supprimés après {{ MEDIA_DAYS }} jours (le texte reste), ou plus tôt si le total dépasse {{ MEDIA_CAP_MB }} Mo. Nettoyage automatique toutes les heures.</small>
+<form method="post" action="/admin/action" style="margin-top:8px">{{ csrf() }}<button class="btn s g" name="act" value="purge">Nettoyer maintenant</button></form></div>
 <div class="kpi">{% for k,l in [('users','Membres'),('u1','Inscrits 24 h'),('u7','Inscrits 7 j'),('posts','Posts'),('comments','Commentaires'),('groups','Groupes'),('reports','Signalements'),('banned','Suspendus'),('msgs','Messages')] %}<div style="margin-bottom:8px"><b>{{ stats[k] }}</b><small>{{ l }}</small></div>{% endfor %}</div>
 <h2>Signalements ouverts</h2>
 {% for x in rows %}<div class="card"><small class="mut">{{ x.r.kind }} · {{ x.r.reason }} · par {{ x.r.rep }} · {{ ago(x.r.created) }}</small>
-{% if x.t %}<p style="margin:8px 0"><a href="/admin/membre/{{ x.t.uid }}" style="color:var(--or2)"><b>{{ x.t.username }}</b></a> : {{ x.t.body[:300] }}</p><p class="mut">Contenu déjà supprimé.</p>{% endif %}
+{% if x.t %}<p style="margin:8px 0"><a href="/admin/membre/{{ x.t.uid }}" style="color:var(--or2)"><b>{{ x.t.username }}</b></a> : {{ x.t.body[:300] }}</p>{% else %}<p class="mut">Contenu déjà supprimé.</p>{% endif %}
 <form method="post" action="/admin/action" class="row" style="flex-wrap:wrap">{{ csrf() }}<input type="hidden" name="id" value="{{ x.r.id }}"><button class="btn s g" name="act" value="dismiss">Ignorer</button>{% if x.t and x.r.kind!='user' %}<button class="btn s" name="act" value="rdelete">Supprimer le contenu</button>{% endif %}{% if x.t %}<button class="btn s r" name="act" value="rban">Suspendre l'auteur</button>{% endif %}</form></div>
 {% else %}<p class="mut" style="text-align:center">Aucun signalement ouvert. 🎉</p>{% endfor %}
 <h2>Journal des actions</h2><div class="grp">{% for l in log %}<div class="it"><span class="grow">{{ l.adm }} · {{ l.action }} {{ l.target }}<small>{{ l.detail }} · {{ ago(l.created) }}</small></span></div>{% else %}<div class="it mut">Aucune action pour l'instant.</div>{% endfor %}</div>{% endblock %}"""
@@ -1985,10 +2303,10 @@ T["admin_user.html"] = r"""{% extends "adm.html" %}{% block a %}<div class="card
 {% else %}<form method="post" action="/admin/action">{{ csrf() }}<input type="hidden" name="id" value="{{ u.id }}"><label style="margin-top:0">Motif de suspension (affiché à la personne)</label><input name="reason" maxlength="120" placeholder="Ex : harcèlement"><p><button class="btn s r" name="act" value="ban">Suspendre ce compte</button></p></form>{% endif %}
 <form method="post" action="/admin/action" onsubmit="return confirm('Supprimer définitivement ce compte et tout son contenu ?')">{{ csrf() }}<input type="hidden" name="id" value="{{ u.id }}"><label>Supprimer le compte : retape le pseudo pour confirmer</label><input name="confirm" placeholder="{{ u.username }}" autocomplete="off"><p><button class="btn s g" name="act" value="delete_user">Supprimer définitivement</button></p></form></div>{% endif %}
 {% for title,items,kind in [('Posts',posts,'post'),('Commentaires',comments,'comment'),('Messages de groupe',cposts,'cpost')] %}<h2>{{ title }}</h2>
-{% for p in items %}<div class="card row"><span class="grow">{% if p.mk %}<a href="/api/groupe/media/{{ p.id }}" target="_blank" style="color:var(--or2)">📎 {{ p.mk }}</a> {% endif %}{{ p.body[:200] }}<small class="mut" style="display:block">{{ ago(p.created) }}</small></span><form method="post" action="/admin/action">{{ csrf() }}<input type="hidden" name="id" value="{{ p.id }}"><input type="hidden" name="kind" value="{{ kind }}"><button class="btn s g" name="act" value="delete_content">{{ ic('trash',14) }}</button></form></div>{% else %}<p class="mut">Rien.</p>{% endfor %}{% endfor %}{% endblock %}"""
+{% for p in items %}<div class="card row"><span class="grow">{% if p.mk %}<a href="/api/groupe/media/{{ p.id }}" target="_blank" style="color:var(--or2)">📎 {{ p.mk }}</a> {% elif p.has_img==1 %}<a href="/api/post/media/{{ p.id }}" target="_blank" style="color:var(--or2)">📎 photo</a> {% endif %}{{ p.body[:200] }}<small class="mut" style="display:block">{{ ago(p.created) }}</small></span><form method="post" action="/admin/action">{{ csrf() }}<input type="hidden" name="id" value="{{ p.id }}"><input type="hidden" name="kind" value="{{ kind }}"><button class="btn s g" name="act" value="delete_content">{{ ic('trash',14) }}</button></form></div>{% else %}<p class="mut">Rien.</p>{% endfor %}{% endfor %}{% endblock %}"""
 
 T["admin_content.html"] = r"""{% extends "adm.html" %}{% block a %}{% for title,items,kind in [('Derniers posts',posts,'post'),('Derniers commentaires',comments,'comment'),('Derniers messages de groupe',cposts,'cpost')] %}<h2>{{ title }}</h2>
-{% for p in items %}<div class="card"><small class="mut"><a href="/admin/membre/{{ p.uid }}" style="color:var(--or2)">{{ p.username }}</a> · {{ ago(p.created) }}</small><p style="margin:6px 0">{% if p.mk %}<a href="/api/groupe/media/{{ p.id }}" target="_blank" style="color:var(--or2)">📎 {{ p.mk }}</a> {% endif %}{{ p.body[:250] }}</p>
+{% for p in items %}<div class="card"><small class="mut"><a href="/admin/membre/{{ p.uid }}" style="color:var(--or2)">{{ p.username }}</a> · {{ ago(p.created) }}</small><p style="margin:6px 0">{% if p.mk %}<a href="/api/groupe/media/{{ p.id }}" target="_blank" style="color:var(--or2)">📎 {{ p.mk }}</a> {% elif p.has_img==1 %}<a href="/api/post/media/{{ p.id }}" target="_blank" style="color:var(--or2)">📎 photo</a> {% endif %}{{ p.body[:250] }}</p>
 <form method="post" action="/admin/action">{{ csrf() }}<input type="hidden" name="id" value="{{ p.id }}"><input type="hidden" name="kind" value="{{ kind }}"><button class="btn s g" name="act" value="delete_content">Supprimer</button></form></div>{% else %}<p class="mut">Rien.</p>{% endfor %}{% endfor %}{% endblock %}"""
 
 T["customize.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Personnaliser mon profil</h1>
@@ -2003,6 +2321,7 @@ T["customize.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Personnalise
 <div class="sec">Style du pseudo</div><div class="chips">{% for k,l in NAMES.items() %}<label class="chp"><input type="radio" name="nm" value="{{ k }}" {{ 'checked' if me.p_name==k }}><span>{{ l }}</span></label>{% endfor %}</div>
 <div class="sec">Bannière</div><div class="chips">{% for k,l in BANNERS.items() %}<label class="chp"><input type="radio" name="banner" value="{{ k }}" {{ 'checked' if me.p_banner==k }}><span>{{ l }}</span></label>{% endfor %}<label class="chp" id="bimg" {{ '' if me.bv else 'hidden' }}><input type="radio" name="banner" value="img" {{ 'checked' if me.p_banner=='img' }}><span>Mon image</span></label></div>
 <div class="sec">Couleur d'accent</div><div class="grp" style="padding:12px 16px"><input type="color" name="color" value="{{ me.p_color }}" style="height:46px;padding:4px"></div>
+<div class="sec">Type d'otaku</div><div class="chips"><label class="chp"><input type="radio" name="otype" value="" {{ 'checked' if not me.otype }}><span>Aucun</span></label>{% for o in OTYPES %}<label class="chp"><input type="radio" name="otype" value="{{ o }}" {{ 'checked' if me.otype==o }}><span>{{ o }}</span></label>{% endfor %}</div>
 <div class="sec">Statut</div><div class="grp" style="padding:12px 16px"><input name="pstatus" maxlength="60" value="{{ me.p_status }}" placeholder="Ex : en plein marathon One Piece 🏴‍☠️"></div>
 <p><button class="btn w">Enregistrer mon profil</button></p></form>
 <script>var F=$('cf'),U={{ me.username|tojson }},IMG={{ ('/u/'+me.username+'/banner?v='+me.bv|string)|tojson if me.bv else 'null' }},csrf="{{ session.get('csrf','') }}";
@@ -2031,7 +2350,7 @@ T["err.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><h1 
 
 app.jinja_loader = DictLoader(T)
 app.jinja_env.globals["css"] = CSS
-app.jinja_env.globals.update(REACTS=REACTS, MEDIA_MAX=MEDIA_MAX)
+app.jinja_env.globals.update(REACTS=REACTS, MEDIA_MAX=MEDIA_MAX, MEDIA_DAYS=MEDIA_DAYS, MEDIA_CAP_MB=MEDIA_CAP_MB, poll_of=poll_of, gav=gav)
 app.jinja_env.globals["js"] = '\nfunction $(x){return document.getElementById(x)}\nfunction esc(s){return String(s==null?\'\':s).replace(/[&<>"\']/g,function(c){return{\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]})}\nvar JK=\'https://api.jikan.moe/v4\',DAYS=[\'monday\',\'tuesday\',\'wednesday\',\'thursday\',\'friday\',\'saturday\',\'sunday\'];\nfunction nerr(e){var m=e&&e.message||String(e);return e&&e.name==\'AbortError\'?\'délai dépassé\':(/Failed to fetch|Load failed|NetworkError/i.test(m)?\'connexion impossible\':m)}\nfunction req(u,o){var ac=new AbortController(),t=setTimeout(function(){ac.abort()},9000);o=o||{};o.signal=ac.signal;\n return fetch(u,o).then(function(r){clearTimeout(t);if(!r.ok)throw new Error(\'HTTP \'+r.status);return r.json()}).catch(function(e){clearTimeout(t);throw new Error(nerr(e))})}\nfunction get(u){return req(u)}\nfunction AL(q,v){return req(\'https://graphql.anilist.co\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({query:q,variables:v||{}})}).then(function(d){if(d.errors)throw new Error(d.errors[0].message);return d.data})}\nfunction purge(){Object.keys(localStorage).forEach(function(x){if(x.indexOf(\'c:\')==0)localStorage.removeItem(x)})}\nfunction cache(k,ttl,fn){k=\'c:\'+k;var c=null;try{c=JSON.parse(localStorage.getItem(k))}catch(e){}\n if(c&&Date.now()-c.t<ttl*6e4)return Promise.resolve(c.d);\n return fn().then(function(d){try{localStorage.setItem(k,JSON.stringify({t:Date.now(),d:d}))}catch(e){purge()}return d},function(e){if(c)return c.d;throw e})}\nfunction strip(s){return String(s||\'\').replace(/<[^>]*>/g,\' \').replace(/\\s+/g,\' \').trim()}\nfunction uniq(l){var s={};return l.filter(function(x){return x.id&&!s[x.id]&&(s[x.id]=1)})}\nfunction shuf(a){for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1)),t=a[i];a[i]=a[j];a[j]=t}return a}\nvar MF=\'idMal isAdult title{romaji english} coverImage{large} averageScore seasonYear startDate{year} episodes chapters format genres studios(isMain:true){nodes{name}} description(asHtml:false)\';\nfunction alm(m){return{id:m.idMal,title:(m.title&&(m.title.english||m.title.romaji))||\'?\',img:(m.coverImage&&m.coverImage.large)||\'\',score:m.averageScore?Math.round(m.averageScore)/10:null,\n year:m.seasonYear||(m.startDate&&m.startDate.year)||null,eps:m.episodes||m.chapters||null,type:m.format||\'\',genres:(m.genres||[]).join(\', \'),\n studio:((m.studios&&m.studios.nodes)||[]).map(function(n){return n.name}).join(\', \'),syn:strip(m.description)}}\nfunction nm(it){var im=(it.images&&it.images.jpg)||{};return{id:it.mal_id,title:it.title_english||it.title||\'?\',img:im.large_image_url||im.image_url||\'\',score:it.score,\n year:it.year||(it.aired&&it.aired.prop&&it.aired.prop.from&&it.aired.prop.from.year),syn:(it.synopsis||\'\').trim(),type:it.type,eps:it.episodes||it.chapters,\n genres:(it.genres||[]).map(function(g){return g.name}).join(\', \'),studio:(it.studios||[]).map(function(g){return g.name}).join(\', \')}}\nfunction fin(a){return uniq(a.filter(function(m){return m&&m.idMal&&!m.isAdult}).map(alm))}\nfunction season(){var d=new Date();return{s:[\'WINTER\',\'SPRING\',\'SUMMER\',\'FALL\'][Math.floor(d.getMonth()/3)],y:d.getFullYear()}}\nfunction dayRange(day){var n=new Date(),tm=(n.getDay()+6)%7,d=new Date(n.getFullYear(),n.getMonth(),n.getDate()+DAYS.indexOf(day)-tm),a=Math.floor(d.getTime()/1000);return[a-1,a+86400]}\nvar STOP={moi:1,quand:1,que:1,qui:1,les:1,des:1,une:1,dans:1,sur:1,pour:1,par:1,avec:1,mon:1,mes:1,son:1,ses:1,est:1,sont:1,the:1,and:1,anime:1,manga:1,saison:1};\nfunction kws(q){return q.toLowerCase().normalize(\'NFD\').replace(/[\\u0300-\\u036f]/g,\'\').replace(/[^a-z0-9\\s]/g,\' \').split(/\\s+/).filter(function(w){return w.length>2&&!STOP[w]}).map(function(w){return/^reincarn/.test(w)?\'reincarnated\':w})}\nfunction alQ(q,sort){return AL(\'query($q:String){Page(page:1,perPage:30){media(type:ANIME,isAdult:false,search:$q,sort:\'+sort+\'){\'+MF+\'}}}\',{q:q}).then(function(d){return fin(d.Page.media)})}\nfunction srch(q){return alQ(q,\'SEARCH_MATCH\').then(function(l){if(l.length)return l;var k=kws(q);if(!k.length)return[];\n return alQ(k.join(\' \'),\'SEARCH_MATCH\').then(function(l2){if(l2.length)return l2;\n  return Promise.all(k.map(function(w){return alQ(w,\'POPULARITY_DESC\').catch(function(){return[]})})).then(function(arr){var sc={},by={};arr.forEach(function(a){a.forEach(function(m){by[m.id]=m;sc[m.id]=(sc[m.id]||0)+1})});\n   return Object.keys(by).map(function(i){return by[i]}).sort(function(a,b){return sc[b.id]-sc[a.id]})})})})}\nfunction alList(kind,o,pg){\n if(kind==\'search\')return srch(o.q||\'\');\n if(kind==\'planning\'){var r=dayRange(o.day||\'monday\');return AL(\'query($a:Int,$b:Int){Page(perPage:50){airingSchedules(airingAt_greater:$a,airingAt_lesser:$b,sort:TIME){media{\'+MF+\'}}}}\',{a:r[0],b:r[1]}).then(function(d){return fin(d.Page.airingSchedules.map(function(x){return x.media}))})}\n var v={p:pg,t:kind==\'manga\'?\'MANGA\':\'ANIME\'},decl=\'$p:Int,$t:MediaType\',args=\'type:$t,isAdult:false\',sort=\'POPULARITY_DESC\';\n if(kind==\'saison\'){var z=season();v.s=z.s;v.y=z.y;decl+=\',$s:MediaSeason,$y:Int\';args+=\',season:$s,seasonYear:$y\'}\n else if(kind==\'top\'){sort=\'SCORE_DESC\';args+=\',popularity_greater:30000\'}\n else if(kind==\'manga\'){sort=\'SCORE_DESC\';args+=\',popularity_greater:10000\'}\n else if(kind==\'trend\')sort=\'TRENDING_DESC\';\n else if(kind==\'explore\'){sort=o.sort||\'POPULARITY_DESC\';args+=\',popularity_greater:3000\';if(o.genre){v.g=o.genre;decl+=\',$g:String\';args+=\',genre:$g\'}if(o.year){v.a=o.year*10000;v.b=o.year*10000+10000;decl+=\',$a:FuzzyDateInt,$b:FuzzyDateInt\';args+=\',startDate_greater:$a,startDate_lesser:$b\'}if(o.min){v.m=+o.min*10;decl+=\',$m:Int\';args+=\',averageScore_greater:$m\'}}\n  return AL(\'query(\'+decl+\'){Page(page:$p,perPage:30){media(\'+args+\',sort:\'+sort+\'){\'+MF+\'}}}\',v).then(function(d){return fin(d.Page.media)})}\nfunction jkList(kind,o,pg){\n var P={saison:\'/seasons/now?limit=24&sfw=true&page=\'+pg,trend:\'/seasons/now?limit=14&sfw=true\',explore:\'/top/anime?limit=25&sfw=true&page=\'+pg,top:\'/top/anime?limit=25&sfw=true&page=\'+pg,manga:\'/top/manga?limit=24&sfw=true&page=\'+pg,\n  planning:\'/schedules?filter=\'+(o.day||\'monday\')+\'&limit=24&sfw=true\',search:\'/anime?q=\'+encodeURIComponent(o.q||\'\')+\'&limit=12&sfw=true&order_by=popularity\'};\n return get(JK+P[kind]).then(function(d){return uniq((d.data||[]).map(nm))})}\nfunction L(kind,o){o=o||{};var pg=o.page||1;\n return cache([kind,o.day||\'\',pg,o.q||\'\',o.genre||\'\',o.year||\'\',o.sort||\'\',o.min||\'\'].join(\'|\'),30,function(){\n  return alList(kind,o,pg).then(function(l){if(!l.length&&kind!=\'search\')throw new Error(\'liste vide\');return l}).catch(function(e1){return jkList(kind,o,pg).catch(function(e2){throw new Error(\'AniList : \'+e1.message+\' · Jikan : \'+e2.message)})})})}\nfunction M(id,kind){return cache(\'m\'+kind+id,60,function(){\n return AL(\'query($i:Int,$t:MediaType){Media(idMal:$i,type:$t){\'+MF+\' nextAiringEpisode{airingAt episode} trailer{id site} characters(perPage:10,sort:ROLE){nodes{name{full} image{medium}}}}}\',{i:id,t:kind==\'manga\'?\'MANGA\':\'ANIME\'}).then(function(d){var x=d.Media,m=alm(x);\n  m.next=x.nextAiringEpisode||null;m.trailer=x.trailer&&x.trailer.site==\'youtube\'?\'https://youtu.be/\'+x.trailer.id:\'\';m.chars=x.characters.nodes.map(function(c){return{title:c.name.full,img:c.image.medium}});return m})\n .catch(function(e1){return get(JK+\'/\'+(kind==\'manga\'?\'manga\':\'anime\')+\'/\'+id).then(function(d){var m=nm(d.data);m.trailer=(d.data.trailer||{}).url||\'\';m.chars=[];\n  if(kind==\'manga\')return m;return get(JK+\'/anime/\'+id+\'/characters\').then(function(c){m.chars=(c.data||[]).slice(0,10).map(function(x){return{title:x.character.name,img:x.character.images.jpg.image_url}});return m}).catch(function(){return m})})})})}\nfunction skI(n){var h=\'\';for(var i=0;i<n;i++)h+=\'<div class="tile"><div class="sk" style="aspect-ratio:2/3;border-radius:14px"></div><div class="sk" style="height:10px;margin-top:6px;width:70%"></div></div>\';return h}\nfunction skT(n){return\'<div class="grid">\'+skI(n)+\'</div>\'}\nfunction skC(n){var h=\'\';for(var i=0;i<n;i++)h+=\'<div class="st"><div class="sk" style="width:72px;height:72px;border-radius:50%"></div></div>\';return h}\nfunction tileItems(l,k){return l.map(function(m){return\'<a class="tile" href="/serie/\'+m.id+(k==\'manga\'?\'?k=manga\':\'\')+\'"><img src="\'+esc(m.img)+\'" loading="lazy" alt="">\'+(m.score?\'<small>★ \'+m.score+\'</small>\':\'\')+\'<b>\'+esc(m.title)+\'</b></a>\'}).join(\'\')}\nfunction tiles(l,k){return l.length?\'<div class="grid">\'+tileItems(l,k)+\'</div>\':\'<p class="mut" style="text-align:center">Aucun résultat.</p>\'}\nfunction rings(l){return l.map(function(m){return\'<a class="st" href="/serie/\'+m.id+\'"><div class="ring"><img src="\'+esc(m.img)+\'" alt="" loading="lazy"></div><span>\'+esc(m.title)+\'</span></a>\'}).join(\'\')}\nfunction posters(l){return l.map(function(m){return\'<a class="st" style="width:96px" href="/serie/\'+m.id+\'"><img src="\'+esc(m.img)+\'" alt="" loading="lazy" style="border-radius:14px;aspect-ratio:2/3;border:0;object-fit:cover;width:100%"><span>\'+esc(m.title)+\'</span></a>\'}).join(\'\')}\nfunction fail(el,e){el.innerHTML=\'<p class="mut" style="grid-column:1/-1;text-align:center;padding:14px">Sources injoignables.<br><small>\'+esc(e&&e.message||e)+\'</small><br><a href="" style="color:var(--or)">Réessayer</a> · <a href="/diagnostic" style="color:var(--or)">Diagnostic</a></p>\'}\n\nfunction dur(s){s=Math.max(0,s);var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+\' j \'+h+\' h\':h?h+\' h \'+m+\' min\':m+\' min\'}\nfunction NX(ids){if(!ids.length)return Promise.resolve({});return cache(\'nx|\'+ids.join(\',\'),30,function(){\n return AL(\'query($i:[Int]){Page(perPage:50){media(idMal_in:$i,type:ANIME){idMal title{romaji english} coverImage{large} nextAiringEpisode{airingAt episode}}}}\',{i:ids.slice(0,50)}).then(function(d){var o={};\n  d.Page.media.forEach(function(m){if(m.nextAiringEpisode)o[m.idMal]={at:m.nextAiringEpisode.airingAt,ep:m.nextAiringEpisode.episode,title:m.title.english||m.title.romaji,img:m.coverImage.large}});return o})})}\n\nfunction fx(b,t){b.innerHTML=\'\';var m={sakura:[\'🌸\',\'fall\'],stars:[\'✨\',\'twk\'],snow:[\'❄️\',\'fall\'],flames:[\'🔥\',\'rise\']}[t];if(!m||(window.matchMedia&&matchMedia(\'(prefers-reduced-motion: reduce)\').matches))return;\n for(var i=0;i<16;i++){var e=document.createElement(\'span\');e.className=\'fxp \'+m[1];e.textContent=m[0];e.style.left=(Math.random()*94)+\'%\';e.style.fontSize=(10+Math.random()*14)+\'px\';\n  e.style.animationDuration=(4+Math.random()*6)+\'s\';e.style.animationDelay=(-Math.random()*8)+\'s\';if(m[1]==\'twk\')e.style.top=(Math.random()*85)+\'%\';b.appendChild(e)}}\n'
 
 def ensure_admin():
@@ -2095,4 +2414,3 @@ def ensure_ready():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
-
