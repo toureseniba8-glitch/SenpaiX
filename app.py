@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS cmedia(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES 
 CREATE TABLE IF NOT EXISTS creacts(pid INTEGER REFERENCES cposts(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,emo TEXT,PRIMARY KEY(pid,user_id));
 CREATE INDEX IF NOT EXISTS cmedia_pid ON cmedia(pid);
 CREATE INDEX IF NOT EXISTS cposts_cid ON cposts(cid,id);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,kind TEXT DEFAULT 'evenement',title TEXT NOT NULL,body TEXT DEFAULT '',link TEXT DEFAULT '',day TEXT DEFAULT '',fin TEXT DEFAULT '',pos INTEGER DEFAULT 0,hidden INTEGER DEFAULT 0,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS eimg(eid INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,data BLOB);
+CREATE TABLE IF NOT EXISTS downloads(id INTEGER PRIMARY KEY,title TEXT NOT NULL,url TEXT NOT NULL,body TEXT DEFAULT '',plat TEXT DEFAULT 'autre',version TEXT DEFAULT '',size TEXT DEFAULT '',hits INTEGER DEFAULT 0,pos INTEGER DEFAULT 0,hidden INTEGER DEFAULT 0,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS dicon(did INTEGER PRIMARY KEY REFERENCES downloads(id) ON DELETE CASCADE,data BLOB);
 CREATE TABLE IF NOT EXISTS trailers(id INTEGER PRIMARY KEY,title TEXT NOT NULL,yt TEXT NOT NULL,mal_id INTEGER DEFAULT 0,stitle TEXT DEFAULT '',pos INTEGER DEFAULT 0,created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gseen(cid INTEGER REFERENCES communities(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,seen INTEGER DEFAULT 0,mute INTEGER DEFAULT 0,PRIMARY KEY(cid,user_id));
 CREATE TABLE IF NOT EXISTS gkick(cid INTEGER REFERENCES communities(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,created TEXT,PRIMARY KEY(cid,user_id));
@@ -152,7 +156,7 @@ if PG:
 else:
     DBError = sqlite3.Error
 DURABLE = PG or not PROD      # sur Render sans Postgres, SQLite est effacé à chaque mise à jour
-ID_TABLES = {"users", "posts", "comments", "communities", "cposts", "cmedia", "pmedia", "trailers", "scores", "notifs", "msgs", "reports", "admin_log"}
+ID_TABLES = {"users", "posts", "comments", "communities", "cposts", "cmedia", "pmedia", "trailers", "events", "downloads", "scores", "notifs", "msgs", "reports", "admin_log"}
 FAV_UPSERT = (" ON CONFLICT (user_id,mal_id) DO UPDATE SET title=EXCLUDED.title,img=EXCLUDED.img,status=EXCLUDED.status,ep=EXCLUDED.ep,"
               "total=EXCLUDED.total,score=EXCLUDED.score,kind=EXCLUDED.kind,updated=EXCLUDED.updated")
 MIGRATIONS = (("users", "email TEXT DEFAULT ''"), ("users", "recovery TEXT DEFAULT ''"), ("users", "banned INTEGER DEFAULT 0"),
@@ -479,7 +483,7 @@ def inject():
 def small_posts():
     """Seuls les envois de médias de groupe peuvent dépasser 256 Ko."""
     if request.method == "POST" and (request.content_length or 0) > 256 * 1024 \
-            and request.path != "/api/publier" and not (request.path.startswith("/api/groupe/") and request.path.endswith("/envoi")):
+            and request.path not in ("/api/publier", "/api/admin/evenement") and not (request.path.startswith("/api/groupe/") and request.path.endswith("/envoi")):
         abort(413)
 
 
@@ -527,7 +531,7 @@ def index():
     posts = db().execute(POSTQ + "WHERE " + " AND ".join(conds) + " ORDER BY p.id DESC LIMIT 40", args).fetchall()
     watch = [r[0] for r in db().execute("SELECT mal_id FROM favs WHERE user_id=? AND status IN('cours','voir') AND kind='anime' ORDER BY updated DESC LIMIT 50", (uid(),))] if me() else []
     trailers = db().execute("SELECT * FROM trailers ORDER BY pos DESC,id DESC LIMIT 8").fetchall()
-    return render_template("home.html", title="Découverte", tab=tab, posts=posts, eta=next_tournament(), watch=watch, trailers=trailers)
+    return render_template("home.html", title="Découverte", tab=tab, posts=posts, eta=next_tournament(), watch=watch, trailers=trailers, events=evt_live(db(), 6), dlcount=db().execute("SELECT COUNT(*) FROM downloads WHERE hidden=0").fetchone()[0])
 
 
 YT_RE = re.compile(r"(?:youtu\.be/|youtube(?:-nocookie)?\.com/(?:watch\?(?:[^#]*&)?v=|embed/|shorts/|live/|v/))([\w-]{11})(?![\w-])")
@@ -540,6 +544,185 @@ def yt_id(v):
         return v
     m = YT_RE.search(v)
     return m.group(1) if m else None
+
+
+EVT_KINDS = {"evenement": "🎉 Événement", "jeu": "🎮 Jeu", "annonce": "📢 Annonce"}
+FR_MOIS = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."]
+
+
+def fdate(v):
+    try:
+        y, m, d = (int(x) for x in (v or "")[:10].split("-"))
+        return f"{d} {FR_MOIS[m - 1]} {y}"
+    except Exception:
+        return ""
+
+
+def clean_link(v):
+    """Lien du bouton : chemin interne (/quiz) ou adresse https:// ; '' si vide ; None si invalide (jamais javascript:, http:, //…)."""
+    v = (v or "").strip()
+    if not v:
+        return ""
+    if re.fullmatch(r"/(?![/\\])[\w\-./?=&%#]{0,200}", v) or re.fullmatch(r"https://[^\s<>\"'\\]{4,280}", v):
+        return v
+    return None
+
+
+def clean_day(v):
+    v = (v or "").strip()
+    return v if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v) and fdate(v) else ""
+
+
+EVT_COLS = "id,kind,title,body,link,day,fin,created"
+
+
+def evt_live(d, limit=6):
+    """Événements visibles : non masqués et pas encore terminés."""
+    return d.execute(f"SELECT {EVT_COLS} FROM events WHERE hidden=0 AND (fin='' OR fin>=?) ORDER BY pos DESC,id DESC LIMIT ?", (now()[:10], limit)).fetchall()
+
+
+@app.route("/evt/<int:i>")
+def evt_img(i):
+    r = db().execute("SELECT data FROM eimg WHERE eid=?", (i,)).fetchone() or abort(404)
+    resp = app.response_class(bytes(r["data"]), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable" if request.args.get("v") else "public, max-age=300"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
+@app.route("/evenements")
+def events_page():
+    d = db()
+    past = d.execute(f"SELECT {EVT_COLS} FROM events WHERE hidden=0 AND fin<>'' AND fin<? ORDER BY fin DESC LIMIT 12", (now()[:10],)).fetchall()
+    return render_template("events.html", title="À la une", rows=evt_live(d, 50), past=past)
+
+
+@app.route("/evenement/<int:i>")
+def event_page(i):
+    e = db().execute(f"SELECT {EVT_COLS},hidden FROM events WHERE id=?", (i,)).fetchone() or abort(404)
+    if e["hidden"] and not is_admin():
+        abort(404)
+    return render_template("event.html", title=e["title"], e=e, over=bool(e["fin"] and e["fin"] < now()[:10]))
+
+
+@app.route("/admin/a-la-une")
+@admin_only
+def admin_events():
+    rows = [rowd(r) for r in db().execute("SELECT id,kind,title,link,day,fin,hidden,created FROM events ORDER BY pos DESC,id DESC").fetchall()]
+    today = now()[:10]
+    for r in rows:
+        r["st"] = "Masqué" if r["hidden"] else ("Terminé" if r["fin"] and r["fin"] < today else "En ligne")
+    return render_template("admin_events.html", title="À la une", tab="events", rows=rows)
+
+
+@app.route("/api/admin/evenement", methods=["POST"])
+def api_evt_add():
+    """Ajout d'un événement / jeu / annonce : corps brut = image JPEG (redimensionnée par la page), le reste dans l'URL."""
+    if not is_admin():
+        return jsonify(error="Réservé aux administrateurs."), 403
+    d, a = db(), request.args
+    data = request.get_data(cache=False)
+    if data[:3] != b"\xff\xd8\xff" or not 500 < len(data) <= 700_000:
+        return jsonify(error="Image invalide (JPEG, 700 Ko maximum)."), 400
+    title, body, link = txt(a.get("t"), 80), txt(a.get("d"), 600), clean_link(a.get("l"))
+    day, fin = clean_day(a.get("dt")), clean_day(a.get("fin"))
+    if not title:
+        return jsonify(error="Donne un titre."), 400
+    if link is None:
+        return jsonify(error="Lien invalide : utilise un chemin comme /quiz ou une adresse https://…"), 400
+    if day and fin and fin < day:
+        return jsonify(error="La date de fin est avant la date de début."), 400
+    if d.execute("SELECT COUNT(*) FROM events").fetchone()[0] >= 40:
+        return jsonify(error="Maximum 40 éléments : supprime-en un d'abord."), 400
+    kind = a.get("c") if a.get("c") in EVT_KINDS else "evenement"
+    top = d.execute("SELECT COALESCE(MAX(pos),0) FROM events").fetchone()[0]
+    eid = d.execute("INSERT INTO events(kind,title,body,link,day,fin,pos,created) VALUES(?,?,?,?,?,?,?,?)", (kind, title, body, link, day, fin, top + 1, now())).lastrowid
+    d.execute("INSERT INTO eimg(eid,data) VALUES(?,?)", (eid, data))
+    alog("ajoute à la une", title, kind)
+    flash("Publié ✨ C'est visible en haut de l'accueil.", "ok")
+    return jsonify(ok=True, id=eid)
+
+
+PLATS = {"android": "🤖 Android", "ios": "🍎 iPhone / iPad", "pc": "💻 PC / Mac", "web": "🌐 Site web", "autre": "📎 Autre"}
+
+
+def dl_url(v):
+    """Lien de téléchargement : uniquement https:// ; None si invalide."""
+    v = (v or "").strip()
+    return v if re.fullmatch(r"https://[^\s<>\"'\\]{4,500}", v) else None
+
+
+def host_of(u):
+    try:
+        return (urllib.parse.urlparse(u).hostname or "").removeprefix("www.")
+    except Exception:
+        return ""
+
+
+DL_COLS = "d.id,d.title,d.url,d.body,d.plat,d.version,d.size,d.hits,d.hidden,d.created,(SELECT COUNT(*) FROM dicon WHERE did=d.id) has_icon"
+
+
+@app.route("/dl/<int:i>/icone")
+def dl_icon(i):
+    r = db().execute("SELECT data FROM dicon WHERE did=?", (i,)).fetchone() or abort(404)
+    resp = app.response_class(bytes(r["data"]), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable" if request.args.get("v") else "public, max-age=300"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
+@app.route("/telechargements")
+def downloads_page():
+    rows = db().execute(f"SELECT {DL_COLS} FROM downloads d WHERE d.hidden=0 ORDER BY d.pos DESC,d.id DESC LIMIT 100").fetchall()
+    return render_template("downloads.html", title="Téléchargements", rows=rows)
+
+
+@app.route("/telecharger/<int:i>")
+def dl_go(i):
+    """Redirige vers le lien enregistré par l'administrateur et compte le clic."""
+    d = db()
+    r = d.execute("SELECT url,hidden FROM downloads WHERE id=?", (i,)).fetchone() or abort(404)
+    if r["hidden"] and not is_admin():
+        abort(404)
+    d.execute("UPDATE downloads SET hits=hits+1 WHERE id=?", (i,))
+    resp = redirect(r["url"])
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+
+
+@app.route("/admin/telechargements")
+@admin_only
+def admin_downloads():
+    rows = db().execute(f"SELECT {DL_COLS} FROM downloads d ORDER BY d.pos DESC,d.id DESC").fetchall()
+    return render_template("admin_downloads.html", title="Téléchargements", tab="downloads", rows=rows)
+
+
+@app.route("/api/admin/telechargement", methods=["POST"])
+def api_dl_add():
+    """Ajout d'un lien de téléchargement : corps brut = icône JPEG facultative, le reste dans l'URL."""
+    if not is_admin():
+        return jsonify(error="Réservé aux administrateurs."), 403
+    d, a = db(), request.args
+    data = request.get_data(cache=False)
+    if data and (data[:3] != b"\xff\xd8\xff" or len(data) > 120_000):
+        return jsonify(error="Icône invalide (JPEG, 120 Ko maximum)."), 400
+    title, url = txt(a.get("t"), 80), dl_url(a.get("u"))
+    if not title:
+        return jsonify(error="Donne un nom."), 400
+    if not url:
+        return jsonify(error="Lien invalide : il doit commencer par https:// (sans espace)."), 400
+    if d.execute("SELECT COUNT(*) FROM downloads").fetchone()[0] >= 60:
+        return jsonify(error="Maximum 60 liens : supprime-en un d'abord."), 400
+    plat = a.get("p") if a.get("p") in PLATS else "autre"
+    top = d.execute("SELECT COALESCE(MAX(pos),0) FROM downloads").fetchone()[0]
+    did = d.execute("INSERT INTO downloads(title,url,body,plat,version,size,pos,created) VALUES(?,?,?,?,?,?,?,?)",
+                    (title, url, txt(a.get("d"), 600), plat, txt(a.get("v"), 20), txt(a.get("s"), 20), top + 1, now())).lastrowid
+    if data:
+        d.execute("INSERT INTO dicon(did,data) VALUES(?,?)", (did, data))
+    alog("ajoute un téléchargement", title, host_of(url))
+    flash("Lien ajouté 📥 Il est visible dans la page Téléchargements.", "ok")
+    return jsonify(ok=True, id=did)
 
 
 @app.route("/bandes-annonces")
@@ -1778,6 +1961,46 @@ def admin_action():
         n = purge_media(d)
         alog("nettoyage médias", f"{n} fichier(s)")
         flash(f"{n} média(s) supprimé(s)." if n else "Rien à nettoyer : tout est récent et sous le plafond.", "ok")
+    elif act == "dl_del":
+        r = d.execute("SELECT title FROM downloads WHERE id=?", (i,)).fetchone()
+        if r:
+            d.execute("DELETE FROM downloads WHERE id=?", (i,))
+            alog("supprime un téléchargement", r["title"])
+            flash("Lien supprimé.", "ok")
+    elif act == "dl_toggle":
+        r = d.execute("SELECT title,hidden FROM downloads WHERE id=?", (i,)).fetchone()
+        if r:
+            d.execute("UPDATE downloads SET hidden=? WHERE id=?", (0 if r["hidden"] else 1, i))
+            alog("masque un téléchargement" if not r["hidden"] else "réaffiche un téléchargement", r["title"])
+    elif act in ("dl_up", "dl_down"):
+        ids = [r["id"] for r in d.execute("SELECT id FROM downloads ORDER BY pos DESC,id DESC")]
+        if i in ids:
+            k = ids.index(i)
+            j = k - 1 if act == "dl_up" else k + 1
+            if 0 <= j < len(ids):
+                ids[k], ids[j] = ids[j], ids[k]
+                for n, rid in enumerate(ids):
+                    d.execute("UPDATE downloads SET pos=? WHERE id=?", (len(ids) - n, rid))
+    elif act == "evt_del":
+        r = d.execute("SELECT title FROM events WHERE id=?", (i,)).fetchone()
+        if r:
+            d.execute("DELETE FROM events WHERE id=?", (i,))
+            alog("supprime de la une", r["title"])
+            flash("Supprimé.", "ok")
+    elif act == "evt_toggle":
+        r = d.execute("SELECT title,hidden FROM events WHERE id=?", (i,)).fetchone()
+        if r:
+            d.execute("UPDATE events SET hidden=? WHERE id=?", (0 if r["hidden"] else 1, i))
+            alog("masque à la une" if not r["hidden"] else "réaffiche à la une", r["title"])
+    elif act in ("evt_up", "evt_down"):
+        ids = [r["id"] for r in d.execute("SELECT id FROM events ORDER BY pos DESC,id DESC")]
+        if i in ids:
+            k = ids.index(i)
+            j = k - 1 if act == "evt_up" else k + 1
+            if 0 <= j < len(ids):
+                ids[k], ids[j] = ids[j], ids[k]
+                for n, rid in enumerate(ids):
+                    d.execute("UPDATE events SET pos=? WHERE id=?", (len(ids) - n, rid))
     elif act == "trailer_add":
         y, t, mid = yt_id(f.get("link")), txt(f.get("title"), 100), toint(f.get("mal_id"), 0, 0, 10 ** 9)
         if not y:
@@ -1977,7 +2200,7 @@ def secure(r):
     h = r.headers
     h["X-Content-Type-Options"] = "nosniff"
     h["X-Frame-Options"] = "DENY"
-    h["Referrer-Policy"] = "same-origin"
+    h.setdefault("Referrer-Policy", "same-origin")
     h["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
     if request.path != "/sw.js":          # le service worker doit pouvoir charger les affiches externes
         h["Content-Security-Policy"] = CSP
@@ -2121,6 +2344,16 @@ html[data-theme=light] .pill.on{background:#14182b;color:#fff}
 .pbar{position:absolute;left:0;right:0;bottom:0;height:3px}.pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--or),var(--or2));transition:width .15s}
 .rec{display:flex;align-items:center;gap:10px;padding:4px 2px}.rec .dot{width:12px;height:12px;border-radius:50%;background:var(--red);animation:pulse 1s infinite}
 .cbar [hidden]{display:none!important}
+.dli{width:56px;height:56px;border-radius:14px;object-fit:cover;flex:none;background:var(--card2)}.dlf{display:flex;align-items:center;justify-content:center;font-size:1.6rem}
+.dlc{margin:10px 0}.dlc p{margin:10px 0 0}.dlc .btn{margin-top:12px}
+.evstrip{display:flex;gap:12px;overflow-x:auto;scroll-snap-type:x mandatory;padding:2px 0 12px}
+.evc{position:relative;flex:none;width:86%;max-width:420px;aspect-ratio:16/9;border-radius:18px;overflow:hidden;scroll-snap-align:start;background:var(--card2);display:block;color:#fff}
+.evc img{width:100%;height:100%;object-fit:cover;display:block}
+.evc .evt{position:absolute;left:0;right:0;bottom:0;padding:28px 14px 12px;background:linear-gradient(#0000,#000d)}
+.evc .evt b{display:block;font-size:1.02rem;line-height:1.2}.evc .evt small{opacity:.85}
+.evk{position:absolute;top:10px;left:10px;background:#000a;backdrop-filter:blur(6px);padding:4px 10px;border-radius:99px;font-size:.72rem;font-weight:700}
+.evgrid{display:grid;gap:14px}.evgrid .evc{width:100%;max-width:none}
+.evhero{width:100%;border-radius:18px;display:block;background:var(--card2)}
 .tstrip{display:flex;gap:12px;overflow-x:auto;padding:2px 0 10px;scroll-snap-type:x proximity}
 .tcard{flex:none;width:230px;color:var(--text);scroll-snap-align:start;display:block}
 .tcard .tth{position:relative;display:block;border-radius:14px;overflow:hidden;aspect-ratio:16/9;background:#000}
@@ -2231,6 +2464,69 @@ document.addEventListener('submit',function(e){var fm=e.target;if(!fm.classList|
  x.onload=function(){var d={};try{d=JSON.parse(x.responseText)}catch(_){}if(d.ok)location.reload();else back(d.error||'Envoi impossible.')};x.onerror=function(){back('Connexion impossible.')};x.send(fm._p.blob)})})();
 </script></body></html>"""
 
+T["ev.html"] = r"""{% macro evcard(e) %}<a class="evc" href="/evenement/{{ e.id }}"><img src="/evt/{{ e.id }}?v={{ e.created|replace('-','')|replace(' ','')|replace(':','') }}" alt="" loading="lazy"><span class="evk">{{ EVT_KINDS.get(e.kind,'') }}</span><span class="evt"><b>{{ e.title }}</b>{% if e.day %}<small>📅 {{ fdate(e.day) }}</small>{% endif %}</span></a>{% endmacro %}"""
+
+T["events.html"] = r"""{% extends "base.html" %}{% from "ev.html" import evcard %}{% set back='/' %}{% block c %}<h1 style="font-size:1.4rem">À la une</h1>
+{% if rows %}<div class="evgrid">{% for e in rows %}{{ evcard(e) }}{% endfor %}</div>{% else %}<p class="mut" style="text-align:center;margin-top:30px">Rien à la une pour le moment.</p>{% endif %}
+{% if past %}<h2>Terminés</h2><div class="evgrid" style="opacity:.75">{% for e in past %}{{ evcard(e) }}{% endfor %}</div>{% endif %}{% endblock %}"""
+
+T["event.html"] = r"""{% extends "base.html" %}{% set back='/evenements' %}{% block c %}<img class="evhero" src="/evt/{{ e.id }}?v={{ e.created|replace('-','')|replace(' ','')|replace(':','') }}" alt="">
+<div class="row" style="margin:12px 0 4px;flex-wrap:wrap"><span class="gj">{{ EVT_KINDS.get(e.kind,'') }}</span>{% if over %}<span class="gj o">Terminé</span>{% endif %}{% if e.hidden %}<span class="gj o">Masqué (visible par toi seul)</span>{% endif %}{% if e.day %}<small class="mut">📅 {{ fdate(e.day) }}{% if e.fin %} → {{ fdate(e.fin) }}{% endif %}</small>{% elif e.fin %}<small class="mut">Jusqu'au {{ fdate(e.fin) }}</small>{% endif %}</div>
+<h1 style="font-size:1.4rem;margin:6px 0">{{ e.title }}</h1>{% if e.body %}<p style="white-space:pre-wrap">{{ e.body }}</p>{% endif %}
+{% if e.link and not over %}<a class="btn w" href="{{ e.link }}" {% if e.link.startswith('https://') %}target="_blank" rel="noopener"{% endif %}>{{ 'Jouer' if e.kind=='jeu' else 'Ouvrir' }}</a>{% endif %}{% endblock %}"""
+
+T["admin_events.html"] = r"""{% extends "adm.html" %}{% block a %}<h2>Ajouter un événement, un jeu ou une annonce</h2>
+<div class="card"><label>Type</label><select id="ek"><option value="evenement">🎉 Événement</option><option value="jeu">🎮 Jeu</option><option value="annonce">📢 Annonce</option></select>
+<label>Image (format 16:9 conseillé, ex. 1280 × 720)</label><button type="button" class="btn s g" onclick="$('ei').click()">{{ ic('image',16) }} Choisir une image</button><input type="file" id="ei" accept="image/*" hidden>
+<div id="epw" hidden style="aspect-ratio:16/9;border-radius:14px;overflow:hidden;margin:10px 0 2px;background:#000"><img id="epv" alt="" style="width:100%;height:100%;object-fit:cover"></div><small id="esz" class="mut"></small>
+<label>Titre</label><input id="et" maxlength="80" placeholder="Ex : Tournoi Quiz du week-end">
+<label>Description (facultatif)</label><textarea id="ed" maxlength="600" style="min-height:84px" placeholder="Règles, récompenses, infos pratiques…"></textarea>
+<label>Lien du bouton (facultatif)</label><input id="el" placeholder="/quiz ou https://…" autocomplete="off"><div class="row" style="flex-wrap:wrap;margin:6px 0">{% for l,h in [('Quiz','/quiz'),('Catalogue','/catalogue'),('Groupes','/communautes'),('Bandes-annonces','/bandes-annonces')] %}<button type="button" class="btn s g" onclick="$('el').value='{{ h }}'">{{ l }}</button>{% endfor %}</div>
+<div class="row"><div class="grow"><label>Début</label><input type="date" id="edt"></div><div class="grow"><label>Fin (disparaît ensuite)</label><input type="date" id="efin"></div></div>
+<div id="eerr" class="flash err" hidden></div><p><button type="button" class="btn w" id="eadd">Publier</button></p></div>
+<h2>En ligne et masqués ({{ rows|length }})</h2>
+{% for e in rows %}<div class="card row" style="align-items:center"><img src="/evt/{{ e.id }}?v={{ e.created|replace('-','')|replace(' ','')|replace(':','') }}" alt="" loading="lazy" style="width:110px;aspect-ratio:16/9;object-fit:cover;border-radius:10px;flex:none{{ ';opacity:.5' if e.st!='En ligne' }}">
+<div class="grow" style="min-width:0"><b>{{ e.title }}</b><small class="mut" style="display:block">{{ EVT_KINDS.get(e.kind,'') }}{% if e.day %} · {{ fdate(e.day) }}{% endif %}{% if e.fin %} → {{ fdate(e.fin) }}{% endif %}</small><small style="display:block;color:{{ 'var(--or2)' if e.st=='En ligne' else 'var(--mut)' }}"><a href="/evenement/{{ e.id }}" style="color:inherit">{{ e.st }}</a></small></div>
+<form method="post" action="/admin/action" style="display:flex;gap:6px;flex-wrap:wrap">{{ csrf() }}<input type="hidden" name="id" value="{{ e.id }}"><button class="btn s g" name="act" value="evt_up" aria-label="Monter" {% if loop.first %}disabled{% endif %}>▲</button><button class="btn s g" name="act" value="evt_down" aria-label="Descendre" {% if loop.last %}disabled{% endif %}>▼</button><button class="btn s g" name="act" value="evt_toggle">{{ 'Afficher' if e.hidden else 'Masquer' }}</button><button class="btn s g" name="act" value="evt_del" onclick="return confirm('Supprimer définitivement ?')">{{ ic('trash',14) }}</button></form></div>
+{% else %}<p class="mut">Rien pour l'instant. Ajoute une image ci-dessus : elle apparaît aussitôt en haut de l'accueil.</p>{% endfor %}
+<script>(function(){var blob=null,csrf="{{ session.get('csrf','') }}";
+function er(m){var e=$('eerr');e.textContent=m;e.hidden=false}
+function fit(file,max,lim){return new Promise(function(res,rej){var u=URL.createObjectURL(file),im=new Image();im.onerror=function(){URL.revokeObjectURL(u);rej(new Error('Image illisible.'))};
+ im.onload=function(){URL.revokeObjectURL(u);var r=Math.min(1,max/Math.max(im.width,im.height)),w=Math.round(im.width*r),h=Math.round(im.height*r),c=document.createElement('canvas');c.width=w;c.height=h;var x=c.getContext('2d');x.fillStyle='#000';x.fillRect(0,0,w,h);x.drawImage(im,0,0,w,h);
+  (function t(q){c.toBlob(function(b){if(!b)return rej(new Error('Conversion impossible.'));if(b.size>lim&&q>.4)return t(q-.1);b.size>lim?rej(new Error('Image trop lourde.')):res(b)},'image/jpeg',q)})(.85)};im.src=u})}
+$('ei').onchange=function(){var f=this.files[0];this.value='';if(!f)return;$('eerr').hidden=true;fit(f,1280,600000).then(function(b){blob=b;$('epv').src=URL.createObjectURL(b);$('epw').hidden=false;$('esz').textContent='Image prête · '+Math.round(b.size/1000)+' Ko (recadrée en 16:9 sur l\'accueil)'},function(e){er(e.message)})};
+$('eadd').onclick=function(){var t=$('et').value.trim();if(!blob)return er('Choisis une image.');if(!t)return er('Donne un titre.');$('eerr').hidden=true;
+ var q=new URLSearchParams({c:$('ek').value,t:t,d:$('ed').value.trim(),l:$('el').value.trim(),dt:$('edt').value,fin:$('efin').value}),b=this;b.disabled=true;
+ fetch('/api/admin/evenement?'+q,{method:'POST',headers:{'Content-Type':'image/jpeg','X-CSRF':csrf},body:blob,credentials:'same-origin'}).then(function(r){return r.json().then(function(d){if(!r.ok||!d.ok)throw new Error(d.error||'Envoi impossible ('+r.status+').');location.href='/admin/a-la-une'})}).catch(function(e){er(e.message);b.disabled=false})}})()</script>{% endblock %}"""
+
+T["downloads.html"] = r"""{% extends "base.html" %}{% set back='/' %}{% block c %}<h1 style="font-size:1.4rem">Téléchargements</h1>
+{% for d in rows %}<div class="card dlc"><div class="row" style="align-items:center;gap:12px">{% if d.has_icon %}<img class="dli" src="/dl/{{ d.id }}/icone?v={{ d.created|replace('-','')|replace(' ','')|replace(':','') }}" alt="" loading="lazy">{% else %}<span class="dli dlf">{{ PLATS.get(d.plat,'📎')[:2] }}</span>{% endif %}
+<div class="grow" style="min-width:0"><b>{{ d.title }}</b><small class="mut" style="display:block">{{ PLATS.get(d.plat,'') }}{% if d.version %} · v{{ d.version }}{% endif %}{% if d.size %} · {{ d.size }}{% endif %}</small></div></div>
+{% if d.body %}<p style="white-space:pre-wrap">{{ d.body }}</p>{% endif %}<a class="btn w" href="/telecharger/{{ d.id }}" target="_blank" rel="nofollow noopener">Télécharger</a><small class="mut" style="display:block;text-align:center;margin-top:6px">Lien externe : {{ host_of(d.url) }}</small></div>
+{% else %}<p class="mut" style="text-align:center;margin-top:30px">Aucun téléchargement pour le moment.</p>{% endfor %}{% endblock %}"""
+
+T["admin_downloads.html"] = r"""{% extends "adm.html" %}{% block a %}<h2>Ajouter un lien de téléchargement</h2>
+<div class="card"><label>Nom</label><input id="dt" maxlength="80" placeholder="Ex : SenpaiX pour Android">
+<label>Lien de téléchargement (https://…)</label><input id="du" type="url" placeholder="https://…" autocomplete="off">
+<label>Plateforme</label><select id="dp">{% for k,v in PLATS.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select>
+<div class="row"><div class="grow"><label>Version (facultatif)</label><input id="dv" maxlength="20" placeholder="1.2.0"></div><div class="grow"><label>Taille (facultatif)</label><input id="ds" maxlength="20" placeholder="24 Mo"></div></div>
+<label>Description (facultatif)</label><textarea id="dd" maxlength="600" style="min-height:84px" placeholder="Nouveautés, comment l'installer…"></textarea>
+<label>Icône (facultatif)</label><div class="row" style="align-items:center"><button type="button" class="btn s g" onclick="$('di').click()">{{ ic('image',16) }} Choisir une icône</button><input type="file" id="di" accept="image/*" hidden><img id="dpv" class="dli" alt="" hidden></div>
+<div id="derr" class="flash err" hidden></div><p><button type="button" class="btn w" id="dadd">Ajouter</button></p></div>
+<h2>Liens en ligne ({{ rows|length }})</h2>
+{% for d in rows %}<div class="card row" style="align-items:center">{% if d.has_icon %}<img class="dli" src="/dl/{{ d.id }}/icone?v={{ d.created|replace('-','')|replace(' ','')|replace(':','') }}" alt="" loading="lazy" style="width:48px;height:48px">{% else %}<span class="dli dlf" style="width:48px;height:48px">{{ PLATS.get(d.plat,'📎')[:2] }}</span>{% endif %}
+<div class="grow" style="min-width:0"><b>{{ d.title }}</b><small class="mut" style="display:block">{{ PLATS.get(d.plat,'') }} · {{ host_of(d.url) }}</small><small style="display:block;color:{{ 'var(--mut)' if d.hidden else 'var(--or2)' }}">{{ 'Masqué' if d.hidden else 'En ligne' }} · {{ d.hits }} clic{{ 's' if d.hits>1 }}</small></div>
+<form method="post" action="/admin/action" style="display:flex;gap:6px;flex-wrap:wrap">{{ csrf() }}<input type="hidden" name="id" value="{{ d.id }}"><button class="btn s g" name="act" value="dl_up" aria-label="Monter" {% if loop.first %}disabled{% endif %}>▲</button><button class="btn s g" name="act" value="dl_down" aria-label="Descendre" {% if loop.last %}disabled{% endif %}>▼</button><button class="btn s g" name="act" value="dl_toggle">{{ 'Afficher' if d.hidden else 'Masquer' }}</button><button class="btn s g" name="act" value="dl_del" onclick="return confirm('Supprimer ce lien ?')">{{ ic('trash',14) }}</button></form></div>
+{% else %}<p class="mut">Aucun lien pour l'instant. Ajoute-en un ci-dessus : il apparaît aussitôt dans la page Téléchargements.</p>{% endfor %}
+<script>(function(){var blob=null,csrf="{{ session.get('csrf','') }}";
+function er(m){var e=$('derr');e.textContent=m;e.hidden=false}
+$('di').onchange=function(){var f=this.files[0];this.value='';if(!f)return;$('derr').hidden=true;var u=URL.createObjectURL(f),im=new Image();im.onerror=function(){URL.revokeObjectURL(u);er('Image illisible.')};
+ im.onload=function(){URL.revokeObjectURL(u);var n=192,c=document.createElement('canvas');c.width=c.height=n;var x=c.getContext('2d'),s=Math.min(im.width,im.height);x.fillStyle='#000';x.fillRect(0,0,n,n);x.drawImage(im,(im.width-s)/2,(im.height-s)/2,s,s,0,0,n,n);
+  c.toBlob(function(b){if(!b)return er('Conversion impossible.');blob=b;$('dpv').src=URL.createObjectURL(b);$('dpv').hidden=false},'image/jpeg',.85)};im.src=u};
+$('dadd').onclick=function(){var t=$('dt').value.trim(),u=$('du').value.trim();if(!t)return er('Donne un nom.');if(!/^https:\/\/\S{4,}$/.test(u))return er('Le lien doit commencer par https:// (sans espace).');$('derr').hidden=true;
+ var q=new URLSearchParams({t:t,u:u,p:$('dp').value,v:$('dv').value.trim(),s:$('ds').value.trim(),d:$('dd').value.trim()}),b=this;b.disabled=true;
+ fetch('/api/admin/telechargement?'+q,{method:'POST',headers:{'Content-Type':'image/jpeg','X-CSRF':csrf},body:blob||'',credentials:'same-origin'}).then(function(r){return r.json().then(function(d){if(!r.ok||!d.ok)throw new Error(d.error||'Envoi impossible ('+r.status+').');location.href='/admin/telechargements'})}).catch(function(e){er(e.message);b.disabled=false})}})()</script>{% endblock %}"""
+
 T["trl.html"] = r"""{% macro tlist(items, grid=False) %}<div class="{{ 'tgrid' if grid else 'tstrip' }}">{% for t in items %}<a class="tcard" href="https://www.youtube.com/watch?v={{ t.yt }}" target="_blank" rel="noopener" data-t="{{ t.title }}" data-m="{{ t.mal_id }}" onclick="return playTrailer('{{ t.yt }}',this)"><span class="tth"><img src="https://img.youtube.com/vi/{{ t.yt }}/mqdefault.jpg" loading="lazy" alt=""><i>▶</i></span><b>{{ t.title }}</b></a>{% endfor %}</div>{% endmacro %}
 {% macro tplayer() %}<div class="sheet tvm" id="tvm" hidden onclick="if(event.target===this)closeT()"><div class="tbox"><div class="tfr" id="tfr"></div><div class="row" style="padding:10px 4px 2px"><b class="grow" id="tti" style="min-width:0"></b><a class="btn s" id="tfi" href="#" hidden>Voir la fiche</a><button type="button" class="btn s g" onclick="closeT()">Fermer</button></div></div></div>
 <script>window.playTrailer=function(id,b){$('tfr').innerHTML='<iframe src="https://www.youtube-nocookie.com/embed/'+id+'?autoplay=1&rel=0&playsinline=1" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen referrerpolicy="strict-origin-when-cross-origin" title="Bande-annonce"></iframe>';
@@ -2259,14 +2555,16 @@ var st;$('ts').oninput=function(){clearTimeout(st);var v=this.value.trim();if(v.
  st=setTimeout(function(){L('search',{q:v}).then(function(l){$('tres').innerHTML=l.slice(0,6).map(function(m,i){return '<button type="button" class="rres" data-i="'+i+'"><img src="'+esc(m.img)+'" alt=""><b>'+esc(m.title)+'</b></button>'}).join('')||'<p class="mut">Aucun résultat.</p>';
  [].forEach.call($('tres').querySelectorAll('.rres'),function(b){b.onclick=function(){var m=l[+b.dataset.i];$('tm').value=m.id;$('tmt').value=m.title;if(!$('tt').value)$('tt').value=m.title+' — Bande-annonce';$('tsel').textContent='Série liée : '+m.title;$('tsel').hidden=false;$('tres').innerHTML='';$('ts').value=''}})},function(e){$('tres').innerHTML='<p class="mut">Recherche impossible ('+esc(e.message)+').</p>'})},400)}})()</script>{% endblock %}"""
 
-T["home.html"] = r"""{% extends "base.html" %}{% from "m.html" import post, cd, ptools with context %}{% from "trl.html" import tlist, tplayer with context %}{% block c %}
+T["home.html"] = r"""{% extends "base.html" %}{% from "m.html" import post, cd, ptools with context %}{% from "trl.html" import tlist, tplayer with context %}{% from "ev.html" import evcard %}{% block c %}
 <div class="hero">L'univers<em>Otaku</em>autrement.</div>
 <div class="stories" id="stories"></div>
 <div class="pills"><a class="pill {{ 'on' if tab=='decouverte' }}" href="/">{{ ic('compass',16) }} Découverte</a><a class="pill {{ 'on' if tab=='suivis' }}" href="/?t=suivis">{{ ic('star',16) }} Mes séries</a><a class="pill" href="/catalogue?t=planning">{{ ic('home',16) }} Planning</a><a class="pill" href="/quiz">{{ ic('game',16) }} Quiz</a></div>
+{% if events %}<div class="row" style="margin:6px 0 0"><h2 class="grow" style="margin:10px 0">À la une</h2><a href="/evenements" style="font-size:.8rem;color:var(--or2)">Tout voir ›</a></div><div class="evstrip">{% for e in events %}{{ evcard(e) }}{% endfor %}</div>{% endif %}
 <a class="promo" href="/quiz"><span class="lg">TKN</span><span><b>Le prochain tournoi solo arrive bientôt</b><small>Démarrage dans {{ (eta//3600) }}h {{ (eta%3600//60) }}m — 10 questions, 15 s chacune</small></span></a>
 {% if me %}<form method="post" action="/publier" class="card pform">{{ csrf() }}<div class="row">{{ ava(me.username,36) }}<textarea name="body" maxlength="1000" placeholder="Partage ton avis, un spoiler (avec précaution)…" style="min-height:52px"></textarea></div>{{ ptools() }}</form>
 {% else %}<div class="card" style="text-align:center">Rejoins la communauté pour publier et jouer.<br><a class="btn s" style="margin-top:8px" href="/inscription">Créer un compte</a></div>{% endif %}
 {% if trailers %}<div class="row" style="margin-top:6px"><h2 class="grow" style="margin:10px 0">Bandes-annonces</h2><a href="/bandes-annonces" style="font-size:.8rem;color:var(--or2)">Tout voir ›</a></div>{{ tlist(trailers) }}{{ tplayer() }}{% endif %}
+{% if dlcount %}<a class="card row" href="/telechargements" style="align-items:center;margin:10px 0;color:var(--text)"><span class="dli dlf" style="width:44px;height:44px;font-size:1.3rem">📥</span><div class="grow"><b>Téléchargements</b><small class="mut" style="display:block">{{ dlcount }} lien{{ 's' if dlcount>1 }} disponible{{ 's' if dlcount>1 }}</small></div><span class="mut">›</span></a>{% endif %}
 {% if watch %}<h2>Tes prochains épisodes</h2><div class="stories" id="nxt">{{ '' }}</div><script>$('nxt').innerHTML=skC(4);NX({{ watch|tojson }}).then(function(o){var a=Object.keys(o).map(function(k){return Object.assign({id:k},o[k])}).sort(function(x,y){return x.at-y.at});
 $('nxt').innerHTML=a.length?a.map(function(m){return'<a class="st" style="width:104px" href="/serie/'+m.id+'"><img src="'+esc(m.img)+'" alt="" loading="lazy" style="border-radius:14px;aspect-ratio:2/3;border:0;object-fit:cover;width:100%"><span><b style="color:var(--or2)">Ép. '+m.ep+'</b> · '+dur(m.at-Date.now()/1000)+'</span></a>'}).join(''):'<p class="mut" style="font-size:.85rem">Aucun épisode à venir pour tes séries.</p>'}).catch(function(e){fail($('nxt'),e)})</script>{% endif %}
 <h2>Fil de la communauté</h2>{% for p in posts %}{{ post(p) }}{% else %}<p class="mut" style="text-align:center;margin-top:24px">{{ 'Ajoute des séries en favori pour voir leurs discussions.' if tab=='suivis' else 'Aucun post pour le moment. Sois le premier !' }}</p>{% endfor %}
@@ -2610,7 +2908,7 @@ T["mylist.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Ma liste</h1>
 T["blocked.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Utilisateurs bloqués</h1><div class="grp">{% for r in rows %}<div class="it">{{ ava(r.username,34) }}<span class="grow">{{ r.username }}</span><form method="post" action="/bloquer/{{ r.username }}">{{ csrf() }}<button class="btn s g">Débloquer</button></form></div>{% else %}<div class="it mut">Personne n'est bloqué.</div>{% endfor %}</div>{% endblock %}"""
 
 T["adm.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Modération</h1>
-<div class="pills">{% for k,l,h in [('reports','Tableau de bord','/admin'),('members','Membres','/admin/membres'),('content','Contenus','/admin/contenus'),('trailers','Bandes-annonces','/admin/bandes-annonces')] %}<a class="pill {{ 'on' if tab==k }}" href="{{ h }}">{{ l }}</a>{% endfor %}<a class="pill" href="/admin/export">⬇ Sauvegarde</a></div>{% block a %}{% endblock %}{% endblock %}"""
+<div class="pills">{% for k,l,h in [('reports','Tableau de bord','/admin'),('members','Membres','/admin/membres'),('content','Contenus','/admin/contenus'),('events','À la une','/admin/a-la-une'),('downloads','Téléchargements','/admin/telechargements'),('trailers','Bandes-annonces','/admin/bandes-annonces')] %}<a class="pill {{ 'on' if tab==k }}" href="{{ h }}">{{ l }}</a>{% endfor %}<a class="pill" href="/admin/export">⬇ Sauvegarde</a></div>{% block a %}{% endblock %}{% endblock %}"""
 
 T["admin.html"] = r"""{% extends "adm.html" %}{% block a %}
 <div class="card" style="border-color:{{ '#2e8b57' if meta.durable else '#e5233b' }}"><b>{{ '✅' if meta.durable else '⚠️' }} Stockage : {{ meta.storage }}{{ ' (permanent)' if meta.durable and meta.storage=='PostgreSQL' else '' }}</b>
@@ -2683,7 +2981,7 @@ T["err.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><h1 
 
 app.jinja_loader = DictLoader(T)
 app.jinja_env.globals["css"] = CSS
-app.jinja_env.globals.update(REACTS=REACTS, MEDIA_MAX=MEDIA_MAX, snip=snip, MEDIA_DAYS=MEDIA_DAYS, MEDIA_CAP_MB=MEDIA_CAP_MB, poll_of=poll_of, gav=gav)
+app.jinja_env.globals.update(PLATS=PLATS, host_of=host_of, REACTS=REACTS, MEDIA_MAX=MEDIA_MAX, snip=snip, MEDIA_DAYS=MEDIA_DAYS, MEDIA_CAP_MB=MEDIA_CAP_MB, EVT_KINDS=EVT_KINDS, fdate=fdate, poll_of=poll_of, gav=gav)
 app.jinja_env.globals["js"] = '\nfunction $(x){return document.getElementById(x)}\nfunction esc(s){return String(s==null?\'\':s).replace(/[&<>"\']/g,function(c){return{\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]})}\nvar JK=\'https://api.jikan.moe/v4\',DAYS=[\'monday\',\'tuesday\',\'wednesday\',\'thursday\',\'friday\',\'saturday\',\'sunday\'];\nfunction nerr(e){var m=e&&e.message||String(e);return e&&e.name==\'AbortError\'?\'délai dépassé\':(/Failed to fetch|Load failed|NetworkError/i.test(m)?\'connexion impossible\':m)}\nfunction req(u,o){var ac=new AbortController(),t=setTimeout(function(){ac.abort()},9000);o=o||{};o.signal=ac.signal;\n return fetch(u,o).then(function(r){clearTimeout(t);if(!r.ok)throw new Error(\'HTTP \'+r.status);return r.json()}).catch(function(e){clearTimeout(t);throw new Error(nerr(e))})}\nfunction get(u){return req(u)}\nfunction AL(q,v){return req(\'https://graphql.anilist.co\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({query:q,variables:v||{}})}).then(function(d){if(d.errors)throw new Error(d.errors[0].message);return d.data})}\nfunction purge(){Object.keys(localStorage).forEach(function(x){if(x.indexOf(\'c:\')==0)localStorage.removeItem(x)})}\nfunction cache(k,ttl,fn){k=\'c:\'+k;var c=null;try{c=JSON.parse(localStorage.getItem(k))}catch(e){}\n if(c&&Date.now()-c.t<ttl*6e4)return Promise.resolve(c.d);\n return fn().then(function(d){try{localStorage.setItem(k,JSON.stringify({t:Date.now(),d:d}))}catch(e){purge()}return d},function(e){if(c)return c.d;throw e})}\nfunction strip(s){return String(s||\'\').replace(/<[^>]*>/g,\' \').replace(/\\s+/g,\' \').trim()}\nfunction uniq(l){var s={};return l.filter(function(x){return x.id&&!s[x.id]&&(s[x.id]=1)})}\nfunction shuf(a){for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1)),t=a[i];a[i]=a[j];a[j]=t}return a}\nvar MF=\'idMal isAdult title{romaji english} coverImage{large} averageScore seasonYear startDate{year} episodes chapters format genres studios(isMain:true){nodes{name}} description(asHtml:false)\';\nfunction alm(m){return{id:m.idMal,title:(m.title&&(m.title.english||m.title.romaji))||\'?\',img:(m.coverImage&&m.coverImage.large)||\'\',score:m.averageScore?Math.round(m.averageScore)/10:null,\n year:m.seasonYear||(m.startDate&&m.startDate.year)||null,eps:m.episodes||m.chapters||null,type:m.format||\'\',genres:(m.genres||[]).join(\', \'),\n studio:((m.studios&&m.studios.nodes)||[]).map(function(n){return n.name}).join(\', \'),syn:strip(m.description)}}\nfunction nm(it){var im=(it.images&&it.images.jpg)||{};return{id:it.mal_id,title:it.title_english||it.title||\'?\',img:im.large_image_url||im.image_url||\'\',score:it.score,\n year:it.year||(it.aired&&it.aired.prop&&it.aired.prop.from&&it.aired.prop.from.year),syn:(it.synopsis||\'\').trim(),type:it.type,eps:it.episodes||it.chapters,\n genres:(it.genres||[]).map(function(g){return g.name}).join(\', \'),studio:(it.studios||[]).map(function(g){return g.name}).join(\', \')}}\nfunction fin(a){return uniq(a.filter(function(m){return m&&m.idMal&&!m.isAdult}).map(alm))}\nfunction season(){var d=new Date();return{s:[\'WINTER\',\'SPRING\',\'SUMMER\',\'FALL\'][Math.floor(d.getMonth()/3)],y:d.getFullYear()}}\nfunction dayRange(day){var n=new Date(),tm=(n.getDay()+6)%7,d=new Date(n.getFullYear(),n.getMonth(),n.getDate()+DAYS.indexOf(day)-tm),a=Math.floor(d.getTime()/1000);return[a-1,a+86400]}\nvar STOP={moi:1,quand:1,que:1,qui:1,les:1,des:1,une:1,dans:1,sur:1,pour:1,par:1,avec:1,mon:1,mes:1,son:1,ses:1,est:1,sont:1,the:1,and:1,anime:1,manga:1,saison:1};\nfunction kws(q){return q.toLowerCase().normalize(\'NFD\').replace(/[\\u0300-\\u036f]/g,\'\').replace(/[^a-z0-9\\s]/g,\' \').split(/\\s+/).filter(function(w){return w.length>2&&!STOP[w]}).map(function(w){return/^reincarn/.test(w)?\'reincarnated\':w})}\nfunction alQ(q,sort){return AL(\'query($q:String){Page(page:1,perPage:30){media(type:ANIME,isAdult:false,search:$q,sort:\'+sort+\'){\'+MF+\'}}}\',{q:q}).then(function(d){return fin(d.Page.media)})}\nfunction srch(q){return alQ(q,\'SEARCH_MATCH\').then(function(l){if(l.length)return l;var k=kws(q);if(!k.length)return[];\n return alQ(k.join(\' \'),\'SEARCH_MATCH\').then(function(l2){if(l2.length)return l2;\n  return Promise.all(k.map(function(w){return alQ(w,\'POPULARITY_DESC\').catch(function(){return[]})})).then(function(arr){var sc={},by={};arr.forEach(function(a){a.forEach(function(m){by[m.id]=m;sc[m.id]=(sc[m.id]||0)+1})});\n   return Object.keys(by).map(function(i){return by[i]}).sort(function(a,b){return sc[b.id]-sc[a.id]})})})})}\nfunction alList(kind,o,pg){\n if(kind==\'search\')return srch(o.q||\'\');\n if(kind==\'planning\'){var r=dayRange(o.day||\'monday\');return AL(\'query($a:Int,$b:Int){Page(perPage:50){airingSchedules(airingAt_greater:$a,airingAt_lesser:$b,sort:TIME){media{\'+MF+\'}}}}\',{a:r[0],b:r[1]}).then(function(d){return fin(d.Page.airingSchedules.map(function(x){return x.media}))})}\n var v={p:pg,t:kind==\'manga\'?\'MANGA\':\'ANIME\'},decl=\'$p:Int,$t:MediaType\',args=\'type:$t,isAdult:false\',sort=\'POPULARITY_DESC\';\n if(kind==\'saison\'){var z=season();v.s=z.s;v.y=z.y;decl+=\',$s:MediaSeason,$y:Int\';args+=\',season:$s,seasonYear:$y\'}\n else if(kind==\'top\'){sort=\'SCORE_DESC\';args+=\',popularity_greater:30000\'}\n else if(kind==\'manga\'){sort=\'SCORE_DESC\';args+=\',popularity_greater:10000\'}\n else if(kind==\'trend\')sort=\'TRENDING_DESC\';\n else if(kind==\'explore\'){sort=o.sort||\'POPULARITY_DESC\';args+=\',popularity_greater:3000\';if(o.genre){v.g=o.genre;decl+=\',$g:String\';args+=\',genre:$g\'}if(o.year){v.a=o.year*10000;v.b=o.year*10000+10000;decl+=\',$a:FuzzyDateInt,$b:FuzzyDateInt\';args+=\',startDate_greater:$a,startDate_lesser:$b\'}if(o.min){v.m=+o.min*10;decl+=\',$m:Int\';args+=\',averageScore_greater:$m\'}}\n  return AL(\'query(\'+decl+\'){Page(page:$p,perPage:30){media(\'+args+\',sort:\'+sort+\'){\'+MF+\'}}}\',v).then(function(d){return fin(d.Page.media)})}\nfunction jkList(kind,o,pg){\n var P={saison:\'/seasons/now?limit=24&sfw=true&page=\'+pg,trend:\'/seasons/now?limit=14&sfw=true\',explore:\'/top/anime?limit=25&sfw=true&page=\'+pg,top:\'/top/anime?limit=25&sfw=true&page=\'+pg,manga:\'/top/manga?limit=24&sfw=true&page=\'+pg,\n  planning:\'/schedules?filter=\'+(o.day||\'monday\')+\'&limit=24&sfw=true\',search:\'/anime?q=\'+encodeURIComponent(o.q||\'\')+\'&limit=12&sfw=true&order_by=popularity\'};\n return get(JK+P[kind]).then(function(d){return uniq((d.data||[]).map(nm))})}\nfunction L(kind,o){o=o||{};var pg=o.page||1;\n return cache([kind,o.day||\'\',pg,o.q||\'\',o.genre||\'\',o.year||\'\',o.sort||\'\',o.min||\'\'].join(\'|\'),30,function(){\n  return alList(kind,o,pg).then(function(l){if(!l.length&&kind!=\'search\')throw new Error(\'liste vide\');return l}).catch(function(e1){return jkList(kind,o,pg).catch(function(e2){throw new Error(\'AniList : \'+e1.message+\' · Jikan : \'+e2.message)})})})}\nfunction M(id,kind){return cache(\'m\'+kind+id,60,function(){\n return AL(\'query($i:Int,$t:MediaType){Media(idMal:$i,type:$t){\'+MF+\' nextAiringEpisode{airingAt episode} trailer{id site} characters(perPage:10,sort:ROLE){nodes{name{full} image{medium}}}}}\',{i:id,t:kind==\'manga\'?\'MANGA\':\'ANIME\'}).then(function(d){var x=d.Media,m=alm(x);\n  m.next=x.nextAiringEpisode||null;m.trailer=x.trailer&&x.trailer.site==\'youtube\'?\'https://youtu.be/\'+x.trailer.id:\'\';m.chars=x.characters.nodes.map(function(c){return{title:c.name.full,img:c.image.medium}});return m})\n .catch(function(e1){return get(JK+\'/\'+(kind==\'manga\'?\'manga\':\'anime\')+\'/\'+id).then(function(d){var m=nm(d.data);m.trailer=(d.data.trailer||{}).url||\'\';m.chars=[];\n  if(kind==\'manga\')return m;return get(JK+\'/anime/\'+id+\'/characters\').then(function(c){m.chars=(c.data||[]).slice(0,10).map(function(x){return{title:x.character.name,img:x.character.images.jpg.image_url}});return m}).catch(function(){return m})})})})}\nfunction skI(n){var h=\'\';for(var i=0;i<n;i++)h+=\'<div class="tile"><div class="sk" style="aspect-ratio:2/3;border-radius:14px"></div><div class="sk" style="height:10px;margin-top:6px;width:70%"></div></div>\';return h}\nfunction skT(n){return\'<div class="grid">\'+skI(n)+\'</div>\'}\nfunction skC(n){var h=\'\';for(var i=0;i<n;i++)h+=\'<div class="st"><div class="sk" style="width:72px;height:72px;border-radius:50%"></div></div>\';return h}\nfunction tileItems(l,k){return l.map(function(m){return\'<a class="tile" href="/serie/\'+m.id+(k==\'manga\'?\'?k=manga\':\'\')+\'"><img src="\'+esc(m.img)+\'" loading="lazy" alt="">\'+(m.score?\'<small>★ \'+m.score+\'</small>\':\'\')+\'<b>\'+esc(m.title)+\'</b></a>\'}).join(\'\')}\nfunction tiles(l,k){return l.length?\'<div class="grid">\'+tileItems(l,k)+\'</div>\':\'<p class="mut" style="text-align:center">Aucun résultat.</p>\'}\nfunction rings(l){return l.map(function(m){return\'<a class="st" href="/serie/\'+m.id+\'"><div class="ring"><img src="\'+esc(m.img)+\'" alt="" loading="lazy"></div><span>\'+esc(m.title)+\'</span></a>\'}).join(\'\')}\nfunction posters(l){return l.map(function(m){return\'<a class="st" style="width:96px" href="/serie/\'+m.id+\'"><img src="\'+esc(m.img)+\'" alt="" loading="lazy" style="border-radius:14px;aspect-ratio:2/3;border:0;object-fit:cover;width:100%"><span>\'+esc(m.title)+\'</span></a>\'}).join(\'\')}\nfunction fail(el,e){el.innerHTML=\'<p class="mut" style="grid-column:1/-1;text-align:center;padding:14px">Sources injoignables.<br><small>\'+esc(e&&e.message||e)+\'</small><br><a href="" style="color:var(--or)">Réessayer</a> · <a href="/diagnostic" style="color:var(--or)">Diagnostic</a></p>\'}\n\nfunction dur(s){s=Math.max(0,s);var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+\' j \'+h+\' h\':h?h+\' h \'+m+\' min\':m+\' min\'}\nfunction NX(ids){if(!ids.length)return Promise.resolve({});return cache(\'nx|\'+ids.join(\',\'),30,function(){\n return AL(\'query($i:[Int]){Page(perPage:50){media(idMal_in:$i,type:ANIME){idMal title{romaji english} coverImage{large} nextAiringEpisode{airingAt episode}}}}\',{i:ids.slice(0,50)}).then(function(d){var o={};\n  d.Page.media.forEach(function(m){if(m.nextAiringEpisode)o[m.idMal]={at:m.nextAiringEpisode.airingAt,ep:m.nextAiringEpisode.episode,title:m.title.english||m.title.romaji,img:m.coverImage.large}});return o})})}\n\nfunction fx(b,t){b.innerHTML=\'\';var m={sakura:[\'🌸\',\'fall\'],stars:[\'✨\',\'twk\'],snow:[\'❄️\',\'fall\'],flames:[\'🔥\',\'rise\']}[t];if(!m||(window.matchMedia&&matchMedia(\'(prefers-reduced-motion: reduce)\').matches))return;\n for(var i=0;i<16;i++){var e=document.createElement(\'span\');e.className=\'fxp \'+m[1];e.textContent=m[0];e.style.left=(Math.random()*94)+\'%\';e.style.fontSize=(10+Math.random()*14)+\'px\';\n  e.style.animationDuration=(4+Math.random()*6)+\'s\';e.style.animationDelay=(-Math.random()*8)+\'s\';if(m[1]==\'twk\')e.style.top=(Math.random()*85)+\'%\';b.appendChild(e)}}\n'
 
 def ensure_admin():
