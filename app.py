@@ -97,6 +97,9 @@ CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,kind TEXT DEFAULT 'even
 CREATE TABLE IF NOT EXISTS eimg(eid INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,data BLOB);
 CREATE TABLE IF NOT EXISTS downloads(id INTEGER PRIMARY KEY,title TEXT NOT NULL,url TEXT NOT NULL,body TEXT DEFAULT '',plat TEXT DEFAULT 'autre',version TEXT DEFAULT '',size TEXT DEFAULT '',hits INTEGER DEFAULT 0,pos INTEGER DEFAULT 0,hidden INTEGER DEFAULT 0,created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS dicon(did INTEGER PRIMARY KEY REFERENCES downloads(id) ON DELETE CASCADE,data BLOB);
+CREATE TABLE IF NOT EXISTS duels(id INTEGER PRIMARY KEY,code TEXT UNIQUE NOT NULL,creator_id INTEGER REFERENCES users(id) ON DELETE CASCADE,to_id INTEGER DEFAULT 0,qs TEXT NOT NULL,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS dplays(id INTEGER PRIMARY KEY,duel_id INTEGER REFERENCES duels(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,n INTEGER DEFAULT 0,good INTEGER DEFAULT 0,ms INTEGER DEFAULT 0,done INTEGER DEFAULT 0,t0 BIGINT DEFAULT 0,tl BIGINT DEFAULT 0,UNIQUE(duel_id,user_id));
+CREATE INDEX IF NOT EXISTS dplays_duel ON dplays(duel_id);
 CREATE TABLE IF NOT EXISTS trailers(id INTEGER PRIMARY KEY,title TEXT NOT NULL,yt TEXT NOT NULL,mal_id INTEGER DEFAULT 0,stitle TEXT DEFAULT '',pos INTEGER DEFAULT 0,created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gseen(cid INTEGER REFERENCES communities(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,seen INTEGER DEFAULT 0,mute INTEGER DEFAULT 0,PRIMARY KEY(cid,user_id));
 CREATE TABLE IF NOT EXISTS gkick(cid INTEGER REFERENCES communities(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,created TEXT,PRIMARY KEY(cid,user_id));
@@ -156,7 +159,7 @@ if PG:
 else:
     DBError = sqlite3.Error
 DURABLE = PG or not PROD      # sur Render sans Postgres, SQLite est effacé à chaque mise à jour
-ID_TABLES = {"users", "posts", "comments", "communities", "cposts", "cmedia", "pmedia", "trailers", "events", "downloads", "scores", "notifs", "msgs", "reports", "admin_log"}
+ID_TABLES = {"users", "posts", "comments", "communities", "cposts", "cmedia", "pmedia", "trailers", "events", "downloads", "duels", "dplays", "scores", "notifs", "msgs", "reports", "admin_log"}
 FAV_UPSERT = (" ON CONFLICT (user_id,mal_id) DO UPDATE SET title=EXCLUDED.title,img=EXCLUDED.img,status=EXCLUDED.status,ep=EXCLUDED.ep,"
               "total=EXCLUDED.total,score=EXCLUDED.score,kind=EXCLUDED.kind,updated=EXCLUDED.updated")
 MIGRATIONS = (("users", "email TEXT DEFAULT ''"), ("users", "recovery TEXT DEFAULT ''"), ("users", "banned INTEGER DEFAULT 0"),
@@ -373,6 +376,24 @@ def toint(v, d=0, lo=0, hi=100000):
         return d
 
 
+# Tout est réservé aux membres connectés. Les visiteurs ne voient que l'écran de bienvenue, la connexion, l'inscription,
+# les pages légales et les aperçus des liens partagés (défi, carte). Pour désactiver : variable d'environnement LOGIN_WALL=0.
+WALL = os.environ.get("LOGIN_WALL", "1") != "0"
+PUBLIC_ENDPOINTS = {"index", "login", "register", "forgot", "logout", "setup", "healthz", "robots", "icon_png", "manifest", "sw", "privacy_page", "terms_page", "about",
+                    "api_pseudo", "diagnostic", "duel_page", "card_page", "static"}
+
+
+@app.before_request
+def login_wall():
+    if not WALL or not READY["ok"] or request.endpoint is None or request.endpoint in PUBLIC_ENDPOINTS or me():
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify(error="Connecte-toi d'abord."), 401
+    if request.method != "GET":
+        return redirect("/connexion")
+    return redirect("/connexion?next=" + urllib.parse.quote(request.full_path.rstrip("?")))
+
+
 def login_required(fn):
     @wraps(fn)
     def w(*a, **k):
@@ -523,6 +544,8 @@ def uid():
 # ───────────────────────────── Accueil / Découverte ─────────────────────────────
 @app.route("/")
 def index():
+    if WALL and not me():
+        return render_template("landing.html", title="Bienvenue", bare=True)
     tab = request.args.get("t", "decouverte")
     conds, args = ["p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id=?)"], [uid(), uid()]
     if tab == "suivis" and me():
@@ -531,7 +554,7 @@ def index():
     posts = db().execute(POSTQ + "WHERE " + " AND ".join(conds) + " ORDER BY p.id DESC LIMIT 40", args).fetchall()
     watch = [r[0] for r in db().execute("SELECT mal_id FROM favs WHERE user_id=? AND status IN('cours','voir') AND kind='anime' ORDER BY updated DESC LIMIT 50", (uid(),))] if me() else []
     trailers = db().execute("SELECT * FROM trailers ORDER BY pos DESC,id DESC LIMIT 8").fetchall()
-    return render_template("home.html", title="Découverte", tab=tab, posts=posts, eta=next_tournament(), watch=watch, trailers=trailers, events=evt_live(db(), 6), dlcount=db().execute("SELECT COUNT(*) FROM downloads WHERE hidden=0").fetchone()[0])
+    return render_template("home.html", title="Découverte", tab=tab, posts=posts, eta=next_tournament(), watch=watch, trailers=trailers, events=evt_live(db(), 6), dlcount=db().execute("SELECT COUNT(*) FROM downloads WHERE hidden=0").fetchone()[0], rk=(user_xp(db(), me()) if me() else None))
 
 
 YT_RE = re.compile(r"(?:youtu\.be/|youtube(?:-nocookie)?\.com/(?:watch\?(?:[^#]*&)?v=|embed/|shorts/|live/|v/))([\w-]{11})(?![\w-])")
@@ -1448,7 +1471,16 @@ def quiz():
     board = d.execute("SELECT u.username,MAX(s.good) g,MIN(s.ms) ms FROM scores s JOIN users u ON u.id=s.user_id WHERE s.day=? AND s.mode='tournoi' "
                       "GROUP BY u.id ORDER BY g DESC,ms ASC LIMIT 10", (day,)).fetchall()
     played = me() and d.execute("SELECT 1 FROM scores WHERE user_id=? AND day=? AND mode='tournoi'", (uid(), day)).fetchone()
-    return render_template("quiz.html", title="Quiz", eta=next_tournament(), stats=stats, board=board, played=played, QC=Q_COUNT, QT=Q_TIME)
+    defier = ""
+    duels = []
+    if me():
+        who = txt(request.args.get("defier"), 40)
+        defier = who if who and who != me()["username"] and d.execute("SELECT 1 FROM users WHERE username=?", (who,)).fetchone() else ""
+        duels = d.execute("SELECT d.code,d.created,u.username cname,(SELECT COUNT(*) FROM dplays WHERE duel_id=d.id AND done=1) np,"
+                          "(SELECT 1 FROM dplays WHERE duel_id=d.id AND user_id=?) mine FROM duels d JOIN users u ON u.id=d.creator_id "
+                          "WHERE d.creator_id=? OR d.to_id=? OR d.id IN (SELECT duel_id FROM dplays WHERE user_id=?) ORDER BY d.id DESC LIMIT 6", (uid(),) * 4).fetchall()
+    return render_template("quiz.html", title="Quiz", eta=next_tournament(), stats=stats, board=board, played=played, QC=Q_COUNT, QT=Q_TIME, defier=defier, duels=duels,
+                           rk=user_xp(d, me()) if me() else None)
 
 
 @app.route("/api/quiz/finish", methods=["POST"])
@@ -1467,6 +1499,177 @@ def api_finish():
         return jsonify(error="Déjà joué aujourd'hui"), 403
     d.execute("INSERT INTO scores(user_id,mode,good,total,ms,day,created) VALUES(?,?,?,?,?,?,?)", (uid(), mode, good, total, max(ms, total * 1500), now()[:10], now()))
     return jsonify(ok=True)
+
+
+# ───────────────────────────── Rangs d'otaku, défis quiz, carte à partager ─────────────────────────────
+RANKS = [(0, "🌱", "Novice"), (100, "🥷", "Genin"), (300, "⚔️", "Chūnin"), (700, "🔥", "Jōnin"), (1500, "⚡", "Sannin"), (3000, "👑", "Kage"), (6000, "🌟", "Légende")]
+XP_RULES = [("Jouer un quiz", "+10"), ("Chaque bonne réponse au quiz", "+3"), ("Relever un défi", "+10"), ("Gagner un défi", "+25"), ("Publier un post", "+15"), ("Commenter", "+5"),
+            ("Recevoir un like", "+3"), ("Rejoindre un groupe", "+10"), ("Ajouter une série en favori", "+2")]
+
+
+def user_xp(d, u, stt=None):
+    """Expérience et rang d'un membre, calculés à partir de son activité (donc valables dès maintenant pour tout le monde)."""
+    i = u["id"]
+    if stt is None:
+        stt, _ = user_stats(d, u)
+    r = d.execute("SELECT (SELECT COALESCE(SUM(good),0) FROM scores WHERE user_id=?) g,(SELECT COUNT(*) FROM dplays WHERE user_id=? AND done=1) dp,"
+                  "(SELECT COUNT(*) FROM dplays p WHERE p.user_id=? AND p.done=1 AND EXISTS (SELECT 1 FROM dplays o WHERE o.duel_id=p.duel_id AND o.done=1 AND o.user_id<>p.user_id) "
+                  "AND NOT EXISTS (SELECT 1 FROM dplays o WHERE o.duel_id=p.duel_id AND o.done=1 AND o.user_id<>p.user_id AND (o.good>p.good OR (o.good=p.good AND o.ms<p.ms)))) dw",
+                  (i, i, i)).fetchone()
+    xp = stt["nq"] * 10 + r["g"] * 3 + stt["np"] * 15 + stt["lk"] * 3 + stt["nc"] * 5 + stt["ng"] * 10 + stt["nf"] * 2 + r["dp"] * 10 + r["dw"] * 25
+    k = max(n for n, (t, _e, _nm) in enumerate(RANKS) if xp >= t)
+    nxt = RANKS[k + 1] if k + 1 < len(RANKS) else None
+    pct = 100 if not nxt else max(0, min(100, int(100 * (xp - RANKS[k][0]) / (nxt[0] - RANKS[k][0]))))
+    return dict(xp=xp, lvl=k + 1, emoji=RANKS[k][1], name=RANKS[k][2], nxt=nxt[2] if nxt else "", need=(nxt[0] - xp) if nxt else 0, pct=pct, dp=r["dp"], dw=r["dw"])
+
+
+def base_url():
+    return os.environ.get("PUBLIC_URL", "").rstrip("/") or request.url_root.rstrip("/")
+
+
+def clean_qs(raw):
+    """Valide les questions d'un défi envoyées par le navigateur ; None si invalides."""
+    if not isinstance(raw, list) or not 5 <= len(raw) <= Q_COUNT:
+        return None
+    out = []
+    for q in raw:
+        if not isinstance(q, dict):
+            return None
+        t, o, a, img = txt(q.get("t"), 320), q.get("o"), q.get("a"), q.get("img") or ""
+        if not t or not isinstance(o, list) or not 2 <= len(o) <= 4 or not isinstance(a, int) or isinstance(a, bool) or not 0 <= a < len(o):
+            return None
+        o = [txt(str(x), 140) for x in o]
+        if not all(o):
+            return None
+        if not (isinstance(img, str) and img.startswith(("https://cdn.myanimelist.net/", "https://s4.anilist.co/"))):
+            img = ""
+        out.append({"t": t, "o": o, "a": a, "img": img})
+    return out
+
+
+def ms_now():
+    return int(time.time() * 1000)
+
+
+def announce_play(d, du, good, total, ms):
+    """Prévient le créateur d'un défi quand quelqu'un d'autre a fini de jouer."""
+    if du["creator_id"] == uid():
+        return
+    cp = d.execute("SELECT good,ms FROM dplays WHERE duel_id=? AND user_id=? AND done=1", (du["id"], du["creator_id"])).fetchone()
+    tail = ""
+    if cp:
+        a, b = (cp["good"], -cp["ms"]), (good, -ms)
+        tail = " · tu gagnes 🏆" if a > b else " · il/elle te bat 😮" if b > a else " · égalité 🤝"
+    notify(du["creator_id"], f"{me()['username']} a relevé ton défi : {good}/{total}{tail}", f"/defi/{du['code']}")
+
+
+def finalize_play(d, du, p, total):
+    """Partie abandonnée (page quittée) : les questions restantes comptent comme fausses."""
+    ms = max(max(p["tl"], p["t0"]) - p["t0"], total * 1500)
+    d.execute("UPDATE dplays SET done=1,ms=? WHERE id=?", (ms, p["id"]))
+    announce_play(d, du, p["good"], total, ms)
+
+
+@app.route("/api/defi/creer", methods=["POST"])
+@login_required
+def api_defi_create():
+    j = request.get_json(silent=True) or {}
+    qs = clean_qs(j.get("qs"))
+    if not qs:
+        return jsonify(error="Questions invalides."), 400
+    if not throttle(f"df{uid()}", 10, 3600):
+        return jsonify(error="Trop de défis : réessaie un peu plus tard."), 429
+    d = db()
+    to = d.execute("SELECT id,dm FROM users WHERE username=?", (txt(j.get("to"), 40),)).fetchone() if j.get("to") else None
+    if to and to["id"] == uid():
+        to = None
+    code = secrets.token_urlsafe(8).lower().replace("-", "x").replace("_", "y")[:8]
+    d.execute("INSERT INTO duels(code,creator_id,to_id,qs,created) VALUES(?,?,?,?,?)", (code, uid(), to["id"] if to else 0, json.dumps(qs, ensure_ascii=False), now()))
+    if to:
+        notify(to["id"], f"{me()['username']} te défie au quiz ⚔️", f"/defi/{code}")
+        if to["dm"] != "none" and not d.execute("SELECT 1 FROM blocks WHERE (user_id=? AND blocked_id=?) OR (user_id=? AND blocked_id=?)", (uid(), to["id"], to["id"], uid())).fetchone():
+            d.execute("INSERT INTO msgs(s,r,body,created) VALUES(?,?,?,?)", (uid(), to["id"], f"⚔️ Je te défie au quiz SenpaiX ! Relève le défi : {base_url()}/defi/{code}", now()))
+    return jsonify(ok=True, code=code)
+
+
+@app.route("/defi/<code>")
+def duel_page(code):
+    d = db()
+    du = d.execute("SELECT d.*,u.username cname FROM duels d JOIN users u ON u.id=d.creator_id WHERE d.code=?", (code[:20],)).fetchone() or abort(404)
+    total = len(json.loads(du["qs"]))
+    mine = d.execute("SELECT * FROM dplays WHERE duel_id=? AND user_id=?", (du["id"], uid())).fetchone() if me() else None
+    if mine and not mine["done"]:
+        finalize_play(d, du, mine, total)
+        mine = d.execute("SELECT * FROM dplays WHERE duel_id=? AND user_id=?", (du["id"], uid())).fetchone()
+    board = [] if (WALL and not me()) else d.execute("SELECT p.user_id,u.username,p.good,p.ms FROM dplays p JOIN users u ON u.id=p.user_id WHERE p.duel_id=? AND p.done=1 ORDER BY p.good DESC,p.ms ASC LIMIT 50", (du["id"],)).fetchall()
+    is_creator = bool(me() and du["creator_id"] == uid())
+    target = next((b for b in board if b["user_id"] == du["creator_id"]), None) if not is_creator else None
+    verdict = ""
+    if mine and target and not is_creator:
+        a, b = (mine["good"], -mine["ms"]), (target["good"], -target["ms"])
+        verdict = "win" if a > b else "lose" if b > a else "draw"
+    url = f"{base_url()}/defi/{du['code']}"
+    share = f"⚔️ Je te défie au quiz SenpaiX ! {'Mon score : ' + str(mine['good']) + '/' + str(total) + '. ' if mine else ''}Bats-moi 👉 {url}"
+    return render_template("defi.html", title=f"Défi de {du['cname']}", du=du, n=total, mine=mine, board=board, is_creator=is_creator, target=target, verdict=verdict,
+                           root=base_url(), url=url, share=share, QT=Q_TIME)
+
+
+@app.route("/api/defi/<code>/start", methods=["POST"])
+@login_required
+def api_defi_start(code):
+    d = db()
+    du = d.execute("SELECT * FROM duels WHERE code=?", (code[:20],)).fetchone() or abort(404)
+    if d.execute("SELECT 1 FROM dplays WHERE duel_id=? AND user_id=?", (du["id"], uid())).fetchone():
+        return jsonify(error="Tu as déjà joué ce défi."), 403
+    if d.execute("SELECT COUNT(*) FROM dplays WHERE duel_id=?", (du["id"],)).fetchone()[0] >= 200:
+        return jsonify(error="Ce défi est complet."), 403
+    if not throttle(f"dp{uid()}", 30, 3600):
+        return jsonify(error="Trop de parties, réessaie plus tard."), 429
+    t = ms_now()
+    d.execute("INSERT INTO dplays(duel_id,user_id,t0,tl) VALUES(?,?,?,?)", (du["id"], uid(), t, t))
+    return jsonify(ok=True, T=Q_TIME, qs=[{"t": q["t"], "o": q["o"], "img": q["img"]} for q in json.loads(du["qs"])])
+
+
+@app.route("/api/defi/<code>/rep", methods=["POST"])
+@login_required
+def api_defi_answer(code):
+    d = db()
+    du = d.execute("SELECT * FROM duels WHERE code=?", (code[:20],)).fetchone() or abort(404)
+    p = d.execute("SELECT * FROM dplays WHERE duel_id=? AND user_id=?", (du["id"], uid())).fetchone()
+    if not p or p["done"]:
+        return jsonify(error="Partie terminée."), 403
+    j = request.get_json(silent=True) or {}
+    qs = json.loads(du["qs"])
+    i, k = toint(j.get("i"), -1, -1, 99), toint(j.get("k"), -1, -1, 9)
+    if i != p["n"] or i >= len(qs):
+        return jsonify(error="Question inattendue."), 400
+    t = ms_now()
+    a = qs[i]["a"]
+    good = p["good"] + (1 if (k == a and t - p["tl"] <= (Q_TIME + 8) * 1000) else 0)   # un peu de marge pour le réseau
+    done = i + 1 >= len(qs)
+    ms = max(t - p["t0"], len(qs) * 1500) if done else 0
+    d.execute("UPDATE dplays SET n=?,good=?,tl=?,ms=?,done=? WHERE id=?", (i + 1, good, t, ms, 1 if done else 0, p["id"]))
+    if done:
+        announce_play(d, du, good, len(qs), ms)
+    return jsonify(ok=True, a=a, good=good, done=done)
+
+
+@app.route("/carte/<username>")
+def card_page(username):
+    d = db()
+    u = d.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone() or abort(404)
+    own = bool(me() and me()["id"] == u["id"])
+    if u["privacy"] == "private" and not own:
+        return render_template("card.html", title=f"Carte de {username}", u=u, locked=True, root=base_url())
+    stt, badges = user_stats(d, u)
+    rk = user_xp(d, u, stt)
+    best = d.execute("SELECT COALESCE(MAX(good),0) FROM scores WHERE user_id=?", (u["id"],)).fetchone()[0]
+    url = f"{base_url()}/carte/{u['username']}"
+    cd = dict(name=u["username"], otype=u["otype"] or "", emoji=rk["emoji"], rank=rk["name"], lvl=rk["lvl"], xp=rk["xp"], pct=rk["pct"], nxt=rk["nxt"], need=rk["need"],
+              stats=[["Meilleur quiz", f"{best}/{Q_COUNT}"], ["Défis gagnés", rk["dw"]], ["Publications", stt["np"]], ["Séries favorites", stt["nf"]]],
+              badges=[b["e"] for b in badges if b["ok"]][:6], avatar=f"/u/{u['username']}/avatar?v={u['av']}" if u["av"] else "", url=url, host=url.split("//")[-1].split("/")[0],
+              text=f"🎴 Ma carte Otaku sur SenpaiX : {rk['emoji']} {rk['name']}, niveau {rk['lvl']} ! Rejoins-moi 👉 {url}")
+    return render_template("card.html", title=f"Carte de {username}", u=u, locked=False, teaser=WALL and not me(), own=own, rk=rk, cd=cd, root=base_url(), url=url)
 
 
 # ───────────────────────────── Profil, messages, notifications ─────────────────────────────
@@ -1501,7 +1704,7 @@ def profile(username):
     favs = d.execute("SELECT * FROM favs WHERE user_id=? LIMIT 20", (u["id"],)).fetchall()
     st = d.execute("SELECT COUNT(*) n,COALESCE(MAX(good),0) b FROM scores WHERE user_id=?", (u["id"],)).fetchone()
     stt, badges = user_stats(d, u)
-    return render_template("profile.html", title=username, u=u, locked=False, posts=posts, favs=favs, st=st, own=own, stt=stt, badges=badges)
+    return render_template("profile.html", title=username, u=u, locked=False, posts=posts, favs=favs, st=st, own=own, stt=stt, badges=badges, rk=user_xp(d, u, stt))
 
 
 @app.route("/u/<username>/<kind>")
@@ -1792,7 +1995,9 @@ def forgot():
 @app.route("/deconnexion", methods=["POST"])
 def logout():
     session.clear()
-    return redirect("/")
+    resp = redirect("/")
+    resp.headers["Clear-Site-Data"] = '"cache", "storage"'   # plus rien de privé ne reste en cache sur l'appareil
+    return resp
 
 
 @app.route("/signaler/<kind>/<int:i>", methods=["POST"])
@@ -2344,6 +2549,16 @@ html[data-theme=light] .pill.on{background:#14182b;color:#fff}
 .pbar{position:absolute;left:0;right:0;bottom:0;height:3px}.pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--or),var(--or2));transition:width .15s}
 .rec{display:flex;align-items:center;gap:10px;padding:4px 2px}.rec .dot{width:12px;height:12px;border-radius:50%;background:var(--red);animation:pulse 1s infinite}
 .cbar [hidden]{display:none!important}
+.wl{min-height:82vh;display:flex;flex-direction:column;justify-content:center;text-align:center}.wlogo{font-size:2.2rem;font-weight:800}.wlogo b{color:var(--or)}
+.wl h1{font-size:2.3rem;line-height:1.1;margin:18px 0 10px}.wl .or{color:var(--or)}.wfoot{margin-top:28px;font-size:.8rem;color:var(--mut)}.wfoot a{color:var(--mut)}
+.rkm{margin:10px 0}.rke{font-size:2rem}.rkm .meter{margin:10px 0 6px}.rkm .meter i{background:linear-gradient(90deg,var(--or),var(--or2))}
+.xpr summary{cursor:pointer;color:var(--or2);font-weight:600;font-size:.85rem;margin:2px 0 8px}.xpr ul{margin:0 0 10px;padding:0;list-style:none}.xpr li{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);font-size:.88rem}.xpr li b{color:var(--or2)}
+.dfh{text-align:center;margin:6px 0 12px}.dfb{font-size:2.6rem}
+.dfv{text-align:center;padding:16px;border-radius:18px;margin:10px 0;font-weight:800;font-size:1.15rem}.dfv.win{background:#1fae6a33;color:#5be39b}.dfv.lose{background:#ff3d7133;color:#ff8aa6}.dfv.draw{background:#ffb02033;color:#ffd27a}
+.ocard{position:relative;overflow:hidden;border-radius:26px;padding:22px 20px;background:linear-gradient(160deg,#0f1b45,#070b1a 70%);border:1px solid var(--line);color:#fff;box-shadow:0 20px 60px #000a;margin:8px 0 14px}
+.ocard:before{content:"";position:absolute;right:-120px;top:-120px;width:340px;height:340px;background:radial-gradient(circle,#ff6a1a66,#0000 70%)}.ocard>*{position:relative}
+.ocg{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}.ocg div{background:#ffffff14;border-radius:14px;padding:10px;text-align:center}.ocg b{display:block;font-size:1.35rem}.ocg small{color:#9fb0d8}
+.ocb{display:flex;gap:6px;flex-wrap:wrap;font-size:1.5rem;margin:6px 0 10px;min-height:1.8rem}
 .dli{width:56px;height:56px;border-radius:14px;object-fit:cover;flex:none;background:var(--card2)}.dlf{display:flex;align-items:center;justify-content:center;font-size:1.6rem}
 .dlc{margin:10px 0}.dlc p{margin:10px 0 0}.dlc .btn{margin-top:12px}
 .evstrip{display:flex;gap:12px;overflow-x:auto;scroll-snap-type:x mandatory;padding:2px 0 12px}
@@ -2430,14 +2645,14 @@ POST_MACRO = r"""{% macro flag(kind, id, username) %}{% if me and me.username!=u
 T = {}
 T["m.html"] = POST_MACRO
 T["base.html"] = r"""<!doctype html><html lang="fr" data-theme="{{ me.theme if me else 'dark' }}"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#070b1a"><link rel="manifest" href="/manifest.json"><link rel="apple-touch-icon" href="/icon-192.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><title>{{ title }} · SenpaiX</title><style>{{ css|safe }}</style><script>{{ js|safe }}</script></head><body>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#070b1a"><link rel="manifest" href="/manifest.json"><link rel="apple-touch-icon" href="/icon-192.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><title>{{ title }} · SenpaiX</title>{% block head %}{% endblock %}<style>{{ css|safe }}</style><script>{{ js|safe }}</script></head><body>
 {% if not bare %}<header><div class="top">{% if back %}<a href="{{ back }}">{{ ic('back') }}</a>{% elif me %}<a href="/profil/{{ me.username }}">{{ ava(me.username,34) }}</a>{% endif %}
-<a class="logo" href="/">Senpai<b>X</b></a><span class="sp"></span><a href="/recherche">{{ ic('search') }}</a>
+<a class="logo" href="/">Senpai<b>X</b></a><span class="sp"></span>{% if me %}<a href="/recherche">{{ ic('search') }}</a>{% endif %}
 {% if me %}<a class="b" href="/notifications">{{ ic('bell') }}{% if unread %}<i>{{ unread }}</i>{% endif %}</a>{% endif %}
-<details class="menu"><summary>{{ ic('dots',24) }}</summary><div class="mn">{% if me %}<a href="/profil/{{ me.username }}">{{ ic('user',18) }} Mon profil</a><a href="/messages">{{ ic('msg',18) }} Messages</a><a href="/parametres">{{ ic('sliders',18) }} Paramètres</a>{% else %}<a href="/connexion">{{ ic('out',18) }} Connexion</a><a href="/inscription">{{ ic('user',18) }} Créer un compte</a>{% endif %}
-{% if me %}<a href="/liste">{{ ic('star',18) }} Ma liste</a>{% endif %}{% if setup_open %}<a href="/installation">{{ ic('shield',18) }} Devenir administrateur</a>{% endif %}<a href="/catalogue">{{ ic('compass',18) }} Catalogue</a>{% if is_admin %}<a href="/admin">{{ ic('shield',18) }} Modération</a>{% endif %}<a href="#" onclick="installApp();return false">{{ ic('dl',18) }} Installer l'app</a><a href="/a-propos">{{ ic('info',18) }} À propos</a><a href="/confidentialite">{{ ic('lock',18) }} Confidentialité</a><a href="/conditions">{{ ic('shield',18) }} Conditions</a><a href="/diagnostic">{{ ic('sliders',18) }} Diagnostic</a>{% if me %}<form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button>{{ ic('out',18) }} Se déconnecter</button></form>{% endif %}</div></details></div></header>{% endif %}
+<details class="menu"><summary>{{ ic('dots',24) }}</summary><div class="mn">{% if me %}<a href="/profil/{{ me.username }}">{{ ic('user',18) }} Mon profil</a><a href="/carte/{{ me.username }}">{{ ic('image',18) }} Ma carte Otaku</a><a href="/messages">{{ ic('msg',18) }} Messages</a><a href="/parametres">{{ ic('sliders',18) }} Paramètres</a>{% else %}<a href="/connexion">{{ ic('out',18) }} Connexion</a><a href="/inscription">{{ ic('user',18) }} Créer un compte</a>{% endif %}
+{% if me %}<a href="/liste">{{ ic('star',18) }} Ma liste</a>{% endif %}{% if setup_open %}<a href="/installation">{{ ic('shield',18) }} Devenir administrateur</a>{% endif %}{% if me %}<a href="/catalogue">{{ ic('compass',18) }} Catalogue</a>{% endif %}{% if is_admin %}<a href="/admin">{{ ic('shield',18) }} Modération</a>{% endif %}<a href="#" onclick="installApp();return false">{{ ic('dl',18) }} Installer l'app</a><a href="/a-propos">{{ ic('info',18) }} À propos</a><a href="/confidentialite">{{ ic('lock',18) }} Confidentialité</a><a href="/conditions">{{ ic('shield',18) }} Conditions</a><a href="/diagnostic">{{ ic('sliders',18) }} Diagnostic</a>{% if me %}<form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button>{{ ic('out',18) }} Se déconnecter</button></form>{% endif %}</div></details></div></header>{% endif %}
 <main>{% if is_admin and not durable %}<a class="flash err" href="/admin" style="display:block">⚠️ Stockage temporaire : les données seront effacées à la prochaine mise à jour. Touche ici pour voir comment corriger.</a>{% endif %}{% for c,m in get_flashed_messages(with_categories=true) %}<div class="flash {{ c }}">{{ m }}</div>{% endfor %}{% block c %}{% endblock %}</main>
-{% if not bare %}<nav class="tabs"><div>{% for h,i,l in [('/','home','Découverte'),('/communautes','users','Groupes'),('/quiz','game','Quiz'),('/catalogue','compass','Catalogue'),('/profil/'+me.username if me else '/connexion','user','Profil')] %}
+{% if not bare and me %}<nav class="tabs"><div>{% for h,i,l in [('/','home','Découverte'),('/communautes','users','Groupes'),('/quiz','game','Quiz'),('/catalogue','compass','Catalogue'),('/profil/'+me.username if me else '/connexion','user','Profil')] %}
 <a href="{{ h }}" class="{{ 'on' if (path==h or (h!='/' and path.startswith(h[:6]))) }} {{ 'mid' if i=='game' }}">{{ ic(i) }}{{ l }}{% if i=='users' and gunread %}<b class="nb">{{ gunread if gunread<100 else '99+' }}</b>{% endif %}</a>{% endfor %}</div></nav>{% endif %}{% if me %}<script>setInterval(function(){if(document.hidden)return;fetch('/api/groupes/non-lus',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){var a=document.querySelector('.tabs a[href="/communautes"]');if(!a)return;var b=a.querySelector('.nb');if(d.n>0){if(!b){b=document.createElement('b');b.className='nb';a.appendChild(b)}b.textContent=d.n>99?'99+':d.n}else if(b)b.remove()}).catch(function(){})},40000)</script>{% endif %}<script>if('serviceWorker' in navigator)addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){})});var DP;addEventListener('beforeinstallprompt',function(e){e.preventDefault();DP=e});
 function installApp(){if(DP){DP.prompt();DP=null}else alert("Menu ⋮ du navigateur → « Installer l'application » ou « Ajouter à l'écran d'accueil ».")}</script><script>var CSRF="{{ session.get('csrf','') }}";
 function openSheet(i){$(i).hidden=false;document.body.style.overflow='hidden'}
@@ -2527,6 +2742,75 @@ $('dadd').onclick=function(){var t=$('dt').value.trim(),u=$('du').value.trim();i
  var q=new URLSearchParams({t:t,u:u,p:$('dp').value,v:$('dv').value.trim(),s:$('ds').value.trim(),d:$('dd').value.trim()}),b=this;b.disabled=true;
  fetch('/api/admin/telechargement?'+q,{method:'POST',headers:{'Content-Type':'image/jpeg','X-CSRF':csrf},body:blob||'',credentials:'same-origin'}).then(function(r){return r.json().then(function(d){if(!r.ok||!d.ok)throw new Error(d.error||'Envoi impossible ('+r.status+').');location.href='/admin/telechargements'})}).catch(function(e){er(e.message);b.disabled=false})}})()</script>{% endblock %}"""
 
+T["rk.html"] = r"""{% macro rkcard(rk) %}<div class="card rkm"><div class="row" style="align-items:center"><span class="rke">{{ rk.emoji }}</span><div class="grow"><b style="font-size:1.05rem">{{ rk.name }}</b><small class="mut" style="display:block">Niveau {{ rk.lvl }} · {{ rk.xp }} XP</small></div></div><div class="meter"><i style="width:{{ rk.pct }}%"></i></div><small class="mut">{% if rk.nxt %}Encore {{ rk.need }} XP pour devenir {{ rk.nxt }}{% else %}Rang maximum atteint 🌟{% endif %}</small></div>{% endmacro %}
+{% macro xprules() %}<details class="xpr"><summary>Comment gagner de l'XP ?</summary><ul>{% for a,b in XP_RULES %}<li><span>{{ a }}</span><b>{{ b }} XP</b></li>{% endfor %}</ul></details>{% endmacro %}"""
+
+T["defi.html"] = r"""{% extends "base.html" %}{% from "rk.html" import rkcard %}{% block head %}<meta property="og:title" content="⚔️ {{ du.cname }} te défie au quiz SenpaiX"><meta property="og:description" content="{{ n }} questions sur les animés, {{ QT }} secondes par question. Relève le défi !"><meta property="og:image" content="{{ root }}/icon-512.png"><meta property="og:url" content="{{ url }}"><meta name="twitter:card" content="summary">{% endblock %}
+{% block c %}<div class="dfh"><div class="dfb">⚔️</div><h1 style="margin:6px 0 2px;font-size:1.35rem">Défi de {{ du.cname }}</h1><small class="mut">{{ n }} questions · {{ QT }} s chacune</small></div>
+<div id="dfhome">
+{% if not me %}<div class="card" style="text-align:center"><p style="margin-top:0">Connecte-toi pour relever ce défi et comparer ton score.</p><a class="btn w" href="/connexion?next=/defi/{{ du.code }}">Se connecter</a><p style="margin:8px 0 0"><a class="btn g w" href="/inscription">Créer un compte</a></p></div>
+{% elif not mine %}<div class="card" style="text-align:center">{% if target %}<p style="margin:0 0 10px">Score à battre : <b style="color:var(--or2)">{{ target.good }}/{{ n }}</b> en {{ '%.1f'|format(target.ms/1000) }} s</p>{% endif %}<button class="btn w" id="go">{{ 'Commencer ma partie' if is_creator else 'Relever le défi' }}</button><p id="dfmsg" class="mut" style="margin:8px 0 0"></p></div>
+{% else %}{% if verdict=='win' %}<div class="dfv win">🏆 Tu as battu {{ du.cname }} !</div>{% elif verdict=='lose' %}<div class="dfv lose">😅 {{ du.cname }} gagne cette manche</div>{% elif verdict=='draw' %}<div class="dfv draw">🤝 Égalité parfaite avec {{ du.cname }} !</div>{% endif %}
+<div class="card" style="text-align:center"><div class="kpi"><div><b>{{ mine.good }}/{{ n }}</b><small>Ton score</small></div><div><b>{{ '%.1f'|format(mine.ms/1000) }} s</b><small>Ton temps</small></div></div>
+<p style="margin:12px 0 8px"><b>{{ 'Envoie ce défi à tes amis !' if is_creator else 'Défie quelqu\'un à ton tour !' }}</b></p>
+<p class="row" style="flex-wrap:wrap;justify-content:center;gap:8px"><a class="btn s" style="background:#25d366" href="https://wa.me/?text={{ share|urlencode }}" target="_blank" rel="noopener">WhatsApp</a><button class="btn s g" id="shr" type="button">Partager</button><button class="btn s g" id="cpl" type="button">Copier le lien</button></p>
+{% if not is_creator %}<p style="margin:10px 0 0"><a class="btn w" href="/quiz" style="background:linear-gradient(100deg,#ff3d71,var(--or))">⚔️ Lancer mon propre défi</a></p>{% endif %}</div>{% endif %}
+{% if me or not WALL %}<h2>Classement du défi</h2><div class="grp">{% for b in board %}<a class="it" href="/profil/{{ b.username }}" {% if me and b.user_id==me.id %}style="outline:1.5px solid var(--or2)"{% endif %}><b style="color:var(--or2);width:26px">{{ '👑' if loop.first and board|length>1 else loop.index }}</b>{{ ava(b.username,30) }}<span class="grow">{{ b.username }}{% if b.user_id==du.creator_id %} <small class="mut">· créateur</small>{% endif %}</span><b>{{ b.good }}/{{ n }}</b><small class="mut" style="width:52px;text-align:right">{{ '%.1f'|format(b.ms/1000) }} s</small></a>{% else %}<div class="it mut">Personne n'a encore joué ce défi.</div>{% endfor %}</div>{% endif %}
+</div>
+<div id="game" hidden><div class="row"><b id="pg">1/{{ n }}</b><span class="grow"></span><b id="tm" style="color:var(--or2)">{{ QT }}</b></div><div class="qbar"><i id="bar"></i></div><div class="card"><p id="qt" style="font-weight:700;margin:0"></p><img id="qi" class="qimg" alt="" hidden><div id="op"></div></div></div>
+<script>(function(){var CODE="{{ du.code }}",csrf="{{ session.get('csrf','') }}",T={{ QT }},Q,i=0,timer,left;
+function api(p,b){return fetch('/api/defi/'+CODE+'/'+p,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},credentials:'same-origin',body:JSON.stringify(b||{})}).then(function(r){return r.json().then(function(d){if(!r.ok||!d.ok)throw new Error(d.error||'erreur '+r.status);return d})})}
+var go=$('go');if(go){go.onclick=function(){go.disabled=true;$('dfmsg').textContent='Chargement…';api('start').then(function(d){Q=d.qs;T=d.T;$('dfhome').hidden=true;$('game').hidden=false;show()},function(e){$('dfmsg').textContent=e.message;go.disabled=false})};
+ if(location.search.indexOf('go=1')>=0)go.click()}
+function tick(){$('tm').textContent=left;$('bar').style.width=(100*left/T)+'%'}
+function show(){var q=Q[i];$('pg').textContent=(i+1)+'/'+Q.length;$('qt').textContent=q.t;var im=$('qi');im.hidden=!q.img;if(q.img)im.src=q.img;$('op').innerHTML='';
+ q.o.forEach(function(o,k){var b=document.createElement('button');b.className='opt';b.textContent=o;b.onclick=function(){pick(k)};$('op').appendChild(b)});left=T;tick();clearInterval(timer);timer=setInterval(function(){left--;tick();if(left<=0)pick(-1)},1000)}
+function pick(k,again){clearInterval(timer);document.querySelectorAll('.opt').forEach(function(b){b.disabled=true});
+ api('rep',{i:i,k:k}).then(function(d){document.querySelectorAll('.opt').forEach(function(b,n){if(n==d.a)b.classList.add('ok');else if(n==k)b.classList.add('no')});
+  if(d.done)return setTimeout(function(){location.href='/defi/'+CODE},1100);i++;setTimeout(show,900)},function(e){if(!again)return setTimeout(function(){pick(k,true)},800);$('qt').textContent='Connexion perdue : '+e.message;setTimeout(function(){location.href='/defi/'+CODE},2500)})}
+var sh=$('shr');if(sh){sh.onclick=function(){var t={{ share|tojson }};if(navigator.share)navigator.share({text:t}).catch(function(){});else{navigator.clipboard.writeText(t);sh.textContent='Copié ✓'}}}
+var cp=$('cpl');if(cp)cp.onclick=function(){navigator.clipboard.writeText({{ url|tojson }}).then(function(){cp.textContent='Lien copié ✓'})}})()</script>{% endblock %}"""
+
+T["card.html"] = r"""{% extends "base.html" %}{% from "rk.html" import rkcard %}{% set back='/profil/' ~ u.username %}{% block head %}{% if not locked %}<meta property="og:title" content="{{ u.username }} · {{ rk.emoji }} {{ rk.name }} sur SenpaiX"><meta property="og:description" content="Niveau {{ rk.lvl }} · {{ rk.xp }} XP. Rejoins la communauté otaku : quiz, défis, groupes et plus."><meta property="og:image" content="{{ root }}/icon-512.png"><meta property="og:url" content="{{ url }}"><meta name="twitter:card" content="summary">{% endif %}{% endblock %}
+{% block c %}{% if locked %}<div class="card" style="text-align:center;margin-top:14px">{{ ic('lock') }} Ce profil est privé.</div>{% elif teaser %}<div class="card" style="text-align:center;margin-top:14px"><div style="font-size:2rem">🎴</div><b>{{ u.username }} partage sa carte Otaku</b><p class="mut" style="margin:6px 0 14px">Connecte-toi pour la voir et découvrir SenpaiX.</p><a class="btn w" href="/connexion?next=/carte/{{ u.username }}">Se connecter</a><p style="margin:8px 0 0"><a class="btn g w" href="/inscription">Créer un compte</a></p></div>{% else %}
+<div class="ocard"><div class="row" style="align-items:center;gap:14px">{{ ava(u.username,84) }}<div class="grow" style="min-width:0"><div style="font-size:1.5rem;font-weight:800;overflow:hidden;text-overflow:ellipsis">{{ u.username }}</div>{% if u.otype %}<div style="color:#ffb27a;font-weight:600">{{ u.otype }}</div>{% endif %}</div></div>
+<div style="margin-top:18px;font-size:1.7rem;font-weight:800">{{ rk.emoji }} {{ rk.name }}</div><div style="color:#9fb0d8">Niveau {{ rk.lvl }} · {{ rk.xp }} XP</div>
+<div class="meter" style="height:10px;margin:10px 0 6px"><i style="width:{{ rk.pct }}%;background:linear-gradient(90deg,#ff6a1a,#ff9a45)"></i></div><small style="color:#9fb0d8">{% if rk.nxt %}Encore {{ rk.need }} XP pour devenir {{ rk.nxt }}{% else %}Rang maximum atteint 🌟{% endif %}</small>
+<div class="ocg">{% for l,v in cd.stats %}<div><b>{{ v }}</b><small>{{ l }}</small></div>{% endfor %}</div>
+<div class="ocb">{% for b in cd.badges %}<span>{{ b }}</span>{% else %}<small style="color:#9fb0d8;font-size:.85rem">Pas encore de badge</small>{% endfor %}</div>
+<div style="text-align:center;color:#ffb27a;font-weight:700">Rejoins-moi sur SenpaiX</div></div>
+<p class="row" style="gap:8px;flex-wrap:wrap"><button class="btn grow" id="sh" type="button">🎴 Partager ma carte{% if not own %} (image){% endif %}</button></p>
+<p class="row" style="gap:8px;flex-wrap:wrap"><a class="btn s grow" style="background:#25d366" id="wa" href="#" target="_blank" rel="noopener">WhatsApp</a><button class="btn s g grow" id="cp" type="button">Copier le lien</button></p><p id="shm" class="mut" style="text-align:center"></p>
+{% if not me %}<div class="card" style="text-align:center"><b>Crée ta propre carte Otaku</b><p class="mut" style="margin:6px 0 10px">Quiz, défis, groupes, et un rang à faire grimper.</p><a class="btn w" href="/inscription">Rejoindre SenpaiX</a></div>{% elif not own %}<p style="text-align:center"><a class="btn s" href="/quiz?defier={{ u.username }}" style="background:linear-gradient(100deg,#ff3d71,var(--or))">⚔️ Défier {{ u.username }}</a></p>{% endif %}
+<script>(function(){var C={{ cd|tojson }};$('wa').href='https://wa.me/?text='+encodeURIComponent(C.text);
+function rr(x,a,b,w,h,r){x.beginPath();x.moveTo(a+r,b);x.arcTo(a+w,b,a+w,b+h,r);x.arcTo(a+w,b+h,a,b+h,r);x.arcTo(a,b+h,a,b,r);x.arcTo(a,b,a+w,b,r);x.closePath()}
+var F='system-ui,-apple-system,Segoe UI,Roboto,sans-serif';
+function draw(img){var W=1080,H=1350,c=document.createElement('canvas');c.width=W;c.height=H;var x=c.getContext('2d');
+ var g=x.createLinearGradient(0,0,W*.6,H);g.addColorStop(0,'#101c4a');g.addColorStop(1,'#070b1a');x.fillStyle=g;x.fillRect(0,0,W,H);
+ var r=x.createRadialGradient(W*.85,H*.08,0,W*.85,H*.08,720);r.addColorStop(0,'rgba(255,106,26,.55)');r.addColorStop(1,'rgba(255,106,26,0)');x.fillStyle=r;x.fillRect(0,0,W,H);
+ x.fillStyle='#fff';x.font='800 54px '+F;x.fillText('Senpai',70,110);var w1=x.measureText('Senpai').width;x.fillStyle='#ff6a1a';x.fillText('X',70+w1,110);
+ x.fillStyle='#9fb0d8';x.font='600 30px '+F;x.textAlign='right';x.fillText('CARTE OTAKU',W-70,108);x.textAlign='left';
+ var ax=70,ay=190,as=220;x.save();x.beginPath();x.arc(ax+as/2,ay+as/2,as/2,0,6.2832);x.closePath();x.clip();
+ if(img){var s=Math.min(img.width,img.height);x.drawImage(img,(img.width-s)/2,(img.height-s)/2,s,s,ax,ay,as,as)}else{var ag=x.createLinearGradient(ax,ay,ax+as,ay+as);ag.addColorStop(0,'#27d3a0');ag.addColorStop(1,'#1c8ee0');x.fillStyle=ag;x.fillRect(ax,ay,as,as);x.fillStyle='#fff';x.font='800 110px '+F;x.textAlign='center';x.fillText(C.name.charAt(0).toUpperCase(),ax+as/2,ay+as/2+38);x.textAlign='left'}
+ x.restore();x.lineWidth=8;x.strokeStyle='#ff6a1a';x.beginPath();x.arc(ax+as/2,ay+as/2,as/2+2,0,6.2832);x.stroke();
+ x.fillStyle='#fff';var sz=84;do{x.font='800 '+sz+'px '+F;sz-=4}while(x.measureText(C.name).width>650&&sz>32);x.fillText(C.name,330,290);
+ if(C.otype){x.fillStyle='#ffb27a';x.font='600 38px '+F;x.fillText(C.otype,330,350)}
+ x.fillStyle='#fff';x.font='800 70px '+F;x.fillText(C.emoji+' '+C.rank,70,520);x.fillStyle='#9fb0d8';x.font='600 36px '+F;x.fillText('Niveau '+C.lvl+' · '+C.xp+' XP',70,578);
+ rr(x,70,612,940,34,17);x.fillStyle='rgba(255,255,255,.14)';x.fill();rr(x,70,612,Math.max(34,940*C.pct/100),34,17);var bg=x.createLinearGradient(70,0,1010,0);bg.addColorStop(0,'#ff6a1a');bg.addColorStop(1,'#ff9a45');x.fillStyle=bg;x.fill();
+ x.fillStyle='#9fb0d8';x.font='500 30px '+F;x.fillText(C.nxt?'Encore '+C.need+' XP pour devenir '+C.nxt:'Rang maximum atteint',70,692);
+ C.stats.forEach(function(s,i){var bx=70+(i%2)*480,by=745+Math.floor(i/2)*190;rr(x,bx,by,460,170,28);x.fillStyle='rgba(255,255,255,.08)';x.fill();x.fillStyle='#fff';x.font='800 72px '+F;x.textAlign='center';x.fillText(String(s[1]),bx+230,by+98);x.fillStyle='#9fb0d8';x.font='600 30px '+F;x.fillText(s[0],bx+230,by+144);x.textAlign='left'});
+ x.font='60px '+F;x.fillStyle='#fff';x.fillText(C.badges.join('  '),70,1190);
+ x.fillStyle='#ff6a1a';x.fillRect(0,H-120,W,120);x.fillStyle='#fff';x.textAlign='center';x.font='800 40px '+F;x.fillText('Rejoins-moi sur SenpaiX',W/2,H-66);x.font='600 28px '+F;x.fillText(C.host,W/2,H-26);return c}
+function make(){return new Promise(function(res){if(!C.avatar)return res(draw(null));var im=new Image();im.onload=function(){res(draw(im))};im.onerror=function(){res(draw(null))};im.src=C.avatar})}
+$('sh').onclick=function(){var b=this;b.disabled=true;make().then(function(c){c.toBlob(function(bl){b.disabled=false;var f=new File([bl],'carte-otaku-'+C.name+'.png',{type:'image/png'});
+ if(navigator.canShare&&navigator.canShare({files:[f]}))return navigator.share({files:[f],title:'Ma carte Otaku SenpaiX',text:C.text}).catch(function(){});
+ var a=document.createElement('a');a.href=URL.createObjectURL(bl);a.download=f.name;document.body.appendChild(a);a.click();a.remove();$('shm').textContent='Image enregistrée : partage-la en statut WhatsApp, sur TikTok ou Instagram !'},'image/png')})};
+$('cp').onclick=function(){var b=this;navigator.clipboard.writeText(C.url).then(function(){b.textContent='Lien copié ✓'})}})()</script>{% endif %}{% endblock %}"""
+
+T["landing.html"] = r"""{% extends "base.html" %}{% block c %}<div class="wl"><div class="wlogo">Senpai<b>X</b></div><h1>L'univers <span class="or">Otaku</span> autrement.</h1>
+<p class="mut" style="margin:0 0 22px">Quiz, défis, groupes, séries… Connecte-toi pour entrer dans la communauté.</p><a class="btn w" href="/connexion">Se connecter</a><p style="margin:10px 0 0"><a class="btn g w" href="/inscription">Créer un compte</a></p>
+<div class="wfoot"><a href="/a-propos">À propos</a> · <a href="/confidentialite">Confidentialité</a> · <a href="/conditions">Conditions</a></div></div>{% endblock %}"""
+
 T["trl.html"] = r"""{% macro tlist(items, grid=False) %}<div class="{{ 'tgrid' if grid else 'tstrip' }}">{% for t in items %}<a class="tcard" href="https://www.youtube.com/watch?v={{ t.yt }}" target="_blank" rel="noopener" data-t="{{ t.title }}" data-m="{{ t.mal_id }}" onclick="return playTrailer('{{ t.yt }}',this)"><span class="tth"><img src="https://img.youtube.com/vi/{{ t.yt }}/mqdefault.jpg" loading="lazy" alt=""><i>▶</i></span><b>{{ t.title }}</b></a>{% endfor %}</div>{% endmacro %}
 {% macro tplayer() %}<div class="sheet tvm" id="tvm" hidden onclick="if(event.target===this)closeT()"><div class="tbox"><div class="tfr" id="tfr"></div><div class="row" style="padding:10px 4px 2px"><b class="grow" id="tti" style="min-width:0"></b><a class="btn s" id="tfi" href="#" hidden>Voir la fiche</a><button type="button" class="btn s g" onclick="closeT()">Fermer</button></div></div></div>
 <script>window.playTrailer=function(id,b){$('tfr').innerHTML='<iframe src="https://www.youtube-nocookie.com/embed/'+id+'?autoplay=1&rel=0&playsinline=1" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen referrerpolicy="strict-origin-when-cross-origin" title="Bande-annonce"></iframe>';
@@ -2555,11 +2839,12 @@ var st;$('ts').oninput=function(){clearTimeout(st);var v=this.value.trim();if(v.
  st=setTimeout(function(){L('search',{q:v}).then(function(l){$('tres').innerHTML=l.slice(0,6).map(function(m,i){return '<button type="button" class="rres" data-i="'+i+'"><img src="'+esc(m.img)+'" alt=""><b>'+esc(m.title)+'</b></button>'}).join('')||'<p class="mut">Aucun résultat.</p>';
  [].forEach.call($('tres').querySelectorAll('.rres'),function(b){b.onclick=function(){var m=l[+b.dataset.i];$('tm').value=m.id;$('tmt').value=m.title;if(!$('tt').value)$('tt').value=m.title+' — Bande-annonce';$('tsel').textContent='Série liée : '+m.title;$('tsel').hidden=false;$('tres').innerHTML='';$('ts').value=''}})},function(e){$('tres').innerHTML='<p class="mut">Recherche impossible ('+esc(e.message)+').</p>'})},400)}})()</script>{% endblock %}"""
 
-T["home.html"] = r"""{% extends "base.html" %}{% from "m.html" import post, cd, ptools with context %}{% from "trl.html" import tlist, tplayer with context %}{% from "ev.html" import evcard %}{% block c %}
+T["home.html"] = r"""{% extends "base.html" %}{% from "rk.html" import rkcard %}{% from "m.html" import post, cd, ptools with context %}{% from "trl.html" import tlist, tplayer with context %}{% from "ev.html" import evcard %}{% block c %}
 <div class="hero">L'univers<em>Otaku</em>autrement.</div>
 <div class="stories" id="stories"></div>
 <div class="pills"><a class="pill {{ 'on' if tab=='decouverte' }}" href="/">{{ ic('compass',16) }} Découverte</a><a class="pill {{ 'on' if tab=='suivis' }}" href="/?t=suivis">{{ ic('star',16) }} Mes séries</a><a class="pill" href="/catalogue?t=planning">{{ ic('home',16) }} Planning</a><a class="pill" href="/quiz">{{ ic('game',16) }} Quiz</a></div>
 {% if events %}<div class="row" style="margin:6px 0 0"><h2 class="grow" style="margin:10px 0">À la une</h2><a href="/evenements" style="font-size:.8rem;color:var(--or2)">Tout voir ›</a></div><div class="evstrip">{% for e in events %}{{ evcard(e) }}{% endfor %}</div>{% endif %}
+{% if rk %}{{ rkcard(rk) }}<p class="row" style="margin:-4px 0 10px"><a class="btn s grow" href="/carte/{{ me.username }}">🎴 Ma carte Otaku</a><a class="btn s grow" href="/quiz" style="background:linear-gradient(100deg,#ff3d71,var(--or))">⚔️ Défier un ami</a></p>{% endif %}
 <a class="promo" href="/quiz"><span class="lg">TKN</span><span><b>Le prochain tournoi solo arrive bientôt</b><small>Démarrage dans {{ (eta//3600) }}h {{ (eta%3600//60) }}m — 10 questions, 15 s chacune</small></span></a>
 {% if me %}<form method="post" action="/publier" class="card pform">{{ csrf() }}<div class="row">{{ ava(me.username,36) }}<textarea name="body" maxlength="1000" placeholder="Partage ton avis, un spoiler (avec précaution)…" style="min-height:52px"></textarea></div>{{ ptools() }}</form>
 {% else %}<div class="card" style="text-align:center">Rejoins la communauté pour publier et jouer.<br><a class="btn s" style="margin-top:8px" href="/inscription">Créer un compte</a></div>{% endif %}
@@ -2759,18 +3044,21 @@ pad();addEventListener('resize',pad);var hm=/^#m(\d+)$/.exec(location.hash);if(!
 <script>(function(){function gup(k,f){if(!f)return;$('gum').textContent='Envoi en cours…';var av=k=='avatar';crop(f,av?256:960,av?256:360,av?68000:165000).then(function(b){return fetch('/api/groupe/{{ c.id }}/img/'+k,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'image/jpeg','X-CSRF':CSRF},body:b})}).then(function(r){return r.json()}).then(function(d){if(d.error)throw new Error(d.error);location.reload()}).catch(function(e){$('gum').textContent='⚠️ '+e.message})}
 $('gfa').onchange=function(){var f=this.files[0];this.value='';gup('avatar',f)};$('gfc').onchange=function(){var f=this.files[0];this.value='';gup('cover',f)}})()</script>{% endif %}{% endblock %}"""
 
-T["quiz.html"] = r"""{% extends "base.html" %}{% from "m.html" import cd with context %}{% block c %}
+T["quiz.html"] = r"""{% extends "base.html" %}{% from "m.html" import cd with context %}{% from "rk.html" import rkcard %}{% block c %}
 <div id="home"><h1>Tournoi</h1><div class="card" style="text-align:center"><small class="mut">Début dans :</small>{{ cd(eta) }}
 <div class="kpi" style="margin:8px 0"><div><b>{{ stats.n if stats else 0 }}</b><small>Tentatives</small></div><div><b>{{ QC }}</b><small>Questions</small></div><div><b>{{ QT }} s</b><small>Temps</small></div></div>
-{% if me %}<button class="btn w" onclick="play('tournoi')" {{ 'disabled style=opacity:.5' if played }}>{{ 'Déjà joué aujourd\'hui' if played else 'Participer au tournoi' }}</button><p style="margin:8px 0 0"><button class="btn g w" onclick="play('solo')">Entraînement solo</button></p>
+{% if me %}<button class="btn w" onclick="play('tournoi')" {{ 'disabled style=opacity:.5' if played }}>{{ 'Déjà joué aujourd\'hui' if played else 'Participer au tournoi' }}</button><p style="margin:8px 0 0"><button class="btn g w" onclick="play('solo')">Entraînement solo</button></p><p style="margin:8px 0 0"><button class="btn w" style="background:linear-gradient(100deg,#ff3d71,var(--or))" onclick="challenge()">⚔️ {{ ('Défier ' ~ defier) if defier else 'Défier un ami' }}</button></p>
 {% else %}<a class="btn w" href="/connexion?next=/quiz">Connecte-toi pour jouer</a>{% endif %}<p id="msg" class="mut"></p></div>
+{% if rk %}{{ rkcard(rk) }}{% endif %}
+{% if duels %}<h2>Mes défis</h2><div class="grp">{% for x in duels %}<a class="it" href="/defi/{{ x.code }}"><span style="font-size:1.4rem">⚔️</span><span class="grow"><b>Défi de {{ x.cname }}</b><small>{{ x.np }} joueur{{ 's' if x.np>1 }} · {{ ago(x.created) }}</small></span>{% if not x.mine %}<b style="color:var(--or)">À relever</b>{% endif %}</a>{% endfor %}</div>{% endif %}
 {% if stats %}<h2>Mes stats</h2><div class="kpi"><div><b>{{ stats.b }}/{{ QC }}</b><small>Meilleur score</small></div><div><b>{{ stats.g }}</b><small>Bonnes réponses</small></div><div><b>{{ (100*stats.g//stats.t) if stats.t else 0 }}%</b><small>Réussite</small></div></div>{% endif %}
 <h2>Classement du jour</h2><div class="grp">{% for b in board %}<a class="it" href="/profil/{{ b.username }}"><b style="color:var(--or2);width:22px">{{ loop.index }}</b>{{ ava(b.username,30) }}<span class="grow">{{ b.username }}</span><b>{{ b.g }}/{{ QC }}</b></a>{% else %}<div class="it mut">Personne n'a encore joué aujourd'hui.</div>{% endfor %}</div>
 <p class="mut" style="font-size:.72rem;text-align:center">Questions générées en direct depuis Jikan / MyAnimeList</p></div>
 <div id="game" hidden><div class="row"><b id="pg">1/10</b><span class="grow"></span><b id="tm" style="color:var(--or2)">15</b></div><div class="qbar"><i id="bar"></i></div><div class="card"><p id="qt" style="font-weight:700;margin:0"></p><img id="qi" class="qimg" alt="" hidden><div id="op"></div></div></div>
 <div id="end" hidden class="card" style="text-align:center"><h1 id="sc"></h1><p class="mut">Bien joué !</p><a class="btn w" href="/quiz">Retour</a></div>
 <script>
-var Q,i,good,t0,timer,left,mode,T={{ QT }},csrf="{{ session.get('csrf','') }}";
+var Q,i,good,t0,timer,left,mode,T={{ QT }},csrf="{{ session.get('csrf','') }}",DEFIER={{ defier|tojson }};
+function challenge(){$('msg').textContent='Préparation du défi…';build().then(function(q){return fetch('/api/defi/creer',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},credentials:'same-origin',body:JSON.stringify({qs:q,to:DEFIER})}).then(function(r){return r.json()})}).then(function(d){if(!d.ok)throw new Error(d.error||'refusé');location.href='/defi/'+d.code+'?go=1'}).catch(function(e){$('msg').textContent='Impossible de créer le défi ('+e.message+').'})}
 function mask(t,title){(title.match(/\w{4,}/g)||[]).forEach(function(w){t=t.replace(new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi'),'▮▮▮')});return t}
 function build(){return L('top',{page:1+Math.floor(Math.random()*3)}).then(function(l){var pool=shuf(l.slice());if(pool.length<8)throw new Error('données insuffisantes');var qs=[];
  pool.slice(0,10).forEach(function(it){var o=shuf(pool.filter(function(x){return x.id!==it.id})).slice(0,3).map(function(x){return x.title}),k=Math.floor(Math.random()*3);
@@ -2786,12 +3074,13 @@ function next(){i++;if(i<Q.length)return show();$('game').hidden=true;$('end').h
  fetch('/api/quiz/finish',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF':csrf},body:JSON.stringify({mode:mode,good:good,total:Q.length,ms:Date.now()-t0})})}
 </script>{% endblock %}"""
 
-T["profile.html"] = r"""{% extends "base.html" %}{% from "m.html" import post with context %}{% block c %}
+T["profile.html"] = r"""{% extends "base.html" %}{% from "m.html" import post with context %}{% from "rk.html" import rkcard, xprules %}{% block c %}
 {% set bk = u.p_banner if (u.p_banner!='img' or u.bv) else 'sunset' %}
 <div class="pcard" style="--c:{{ u.p_color or '#ff6a1a' }}"><div class="pbanner bn-{{ bk }}" {% if bk=='img' %}style="background-image:url(/u/{{ u.username }}/banner?v={{ u.bv }})"{% endif %}><div class="fxbox" id="fxb" data-fx="{{ u.p_fx or 'none' }}"></div></div>
 <div class="pmeta">{{ ava(u.username,92) }}<br><h1 class="nm nm-{{ u.p_name or 'normal' }}">{{ u.username }}</h1>{% if u.otype and not locked %}<br><span class="otype">{{ u.otype }}</span>{% endif %}{% if u.p_status and not locked %}<br><span class="pstatus">{{ u.p_status }}</span>{% endif %}<br><small class="mut">Membre depuis {{ u.created[:10] }}</small>{% if not locked %}<p>{{ u.bio }}</p>{% endif %}
-{% if me and not own %}<a class="btn s" href="/messages/{{ u.username }}">{{ ic('msg',16) }} Message</a> <form method="post" action="/bloquer/{{ u.username }}" style="display:inline">{{ csrf() }}<button class="btn s g">Bloquer</button></form> <form method="post" action="/signaler/user/{{ u.id }}" style="display:inline">{{ csrf() }}<input type="hidden" name="reason" value="Contenu inapproprié"><button class="btn s g">Signaler</button></form>{% elif own %}<a class="btn s" href="/profil/modifier">✨ Personnaliser</a> <a class="btn s g" href="/parametres">{{ ic('sliders',16) }} Paramètres</a>{% endif %}</div></div>
+{% if me and not own %}<a class="btn s" href="/messages/{{ u.username }}">{{ ic('msg',16) }} Message</a> <a class="btn s" href="/quiz?defier={{ u.username }}" style="background:linear-gradient(100deg,#ff3d71,var(--or))">⚔️ Défier</a> <form method="post" action="/bloquer/{{ u.username }}" style="display:inline">{{ csrf() }}<button class="btn s g">Bloquer</button></form> <form method="post" action="/signaler/user/{{ u.id }}" style="display:inline">{{ csrf() }}<input type="hidden" name="reason" value="Contenu inapproprié"><button class="btn s g">Signaler</button></form>{% elif own %}<a class="btn s" href="/profil/modifier">✨ Personnaliser</a> <a class="btn s g" href="/parametres">{{ ic('sliders',16) }} Paramètres</a>{% endif %}</div></div>
 {% if locked %}<div class="card" style="text-align:center;margin-top:14px">{{ ic('lock') }} Ce profil est privé.</div>{% else %}
+{{ rkcard(rk) }}<p class="row" style="margin:0 0 8px"><a class="btn s grow" href="/carte/{{ u.username }}">🎴 {{ 'Ma carte Otaku' if own else 'Sa carte Otaku' }}</a></p>{% if own %}{{ xprules() }}{% endif %}
 <div class="kpi" style="margin:14px 0 8px"><div><b>{{ stt.np }}</b><small>Posts</small></div><div><b>{{ favs|length }}</b><small>Favoris</small></div><div><b>{{ st.b }}/10</b><small>Meilleur quiz</small></div></div>
 <div class="kpi" style="margin:0 0 14px"><div><b>{{ stt.lk }}</b><small>Likes reçus</small></div><div><b>{{ stt.ng }}</b><small>Groupes</small></div><div><b>{{ stt.nq }}</b><small>Quiz joués</small></div></div>
 <h2>Badges <small class="mut" style="font-weight:400">{{ badges|selectattr('ok')|list|length }}/{{ badges|length }}</small></h2><div class="badges">{% for b in badges %}<div class="bdg{{ ' on' if b.ok }}" title="{{ b.d }}"><span>{{ b.e }}</span><small>{{ b.n }}</small></div>{% endfor %}</div>
@@ -2981,7 +3270,7 @@ T["err.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><h1 
 
 app.jinja_loader = DictLoader(T)
 app.jinja_env.globals["css"] = CSS
-app.jinja_env.globals.update(PLATS=PLATS, host_of=host_of, REACTS=REACTS, MEDIA_MAX=MEDIA_MAX, snip=snip, MEDIA_DAYS=MEDIA_DAYS, MEDIA_CAP_MB=MEDIA_CAP_MB, EVT_KINDS=EVT_KINDS, fdate=fdate, poll_of=poll_of, gav=gav)
+app.jinja_env.globals.update(WALL=WALL, XP_RULES=XP_RULES, PLATS=PLATS, host_of=host_of, REACTS=REACTS, MEDIA_MAX=MEDIA_MAX, snip=snip, MEDIA_DAYS=MEDIA_DAYS, MEDIA_CAP_MB=MEDIA_CAP_MB, EVT_KINDS=EVT_KINDS, fdate=fdate, poll_of=poll_of, gav=gav)
 app.jinja_env.globals["js"] = '\nfunction $(x){return document.getElementById(x)}\nfunction esc(s){return String(s==null?\'\':s).replace(/[&<>"\']/g,function(c){return{\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]})}\nvar JK=\'https://api.jikan.moe/v4\',DAYS=[\'monday\',\'tuesday\',\'wednesday\',\'thursday\',\'friday\',\'saturday\',\'sunday\'];\nfunction nerr(e){var m=e&&e.message||String(e);return e&&e.name==\'AbortError\'?\'délai dépassé\':(/Failed to fetch|Load failed|NetworkError/i.test(m)?\'connexion impossible\':m)}\nfunction req(u,o){var ac=new AbortController(),t=setTimeout(function(){ac.abort()},9000);o=o||{};o.signal=ac.signal;\n return fetch(u,o).then(function(r){clearTimeout(t);if(!r.ok)throw new Error(\'HTTP \'+r.status);return r.json()}).catch(function(e){clearTimeout(t);throw new Error(nerr(e))})}\nfunction get(u){return req(u)}\nfunction AL(q,v){return req(\'https://graphql.anilist.co\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({query:q,variables:v||{}})}).then(function(d){if(d.errors)throw new Error(d.errors[0].message);return d.data})}\nfunction purge(){Object.keys(localStorage).forEach(function(x){if(x.indexOf(\'c:\')==0)localStorage.removeItem(x)})}\nfunction cache(k,ttl,fn){k=\'c:\'+k;var c=null;try{c=JSON.parse(localStorage.getItem(k))}catch(e){}\n if(c&&Date.now()-c.t<ttl*6e4)return Promise.resolve(c.d);\n return fn().then(function(d){try{localStorage.setItem(k,JSON.stringify({t:Date.now(),d:d}))}catch(e){purge()}return d},function(e){if(c)return c.d;throw e})}\nfunction strip(s){return String(s||\'\').replace(/<[^>]*>/g,\' \').replace(/\\s+/g,\' \').trim()}\nfunction uniq(l){var s={};return l.filter(function(x){return x.id&&!s[x.id]&&(s[x.id]=1)})}\nfunction shuf(a){for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1)),t=a[i];a[i]=a[j];a[j]=t}return a}\nvar MF=\'idMal isAdult title{romaji english} coverImage{large} averageScore seasonYear startDate{year} episodes chapters format genres studios(isMain:true){nodes{name}} description(asHtml:false)\';\nfunction alm(m){return{id:m.idMal,title:(m.title&&(m.title.english||m.title.romaji))||\'?\',img:(m.coverImage&&m.coverImage.large)||\'\',score:m.averageScore?Math.round(m.averageScore)/10:null,\n year:m.seasonYear||(m.startDate&&m.startDate.year)||null,eps:m.episodes||m.chapters||null,type:m.format||\'\',genres:(m.genres||[]).join(\', \'),\n studio:((m.studios&&m.studios.nodes)||[]).map(function(n){return n.name}).join(\', \'),syn:strip(m.description)}}\nfunction nm(it){var im=(it.images&&it.images.jpg)||{};return{id:it.mal_id,title:it.title_english||it.title||\'?\',img:im.large_image_url||im.image_url||\'\',score:it.score,\n year:it.year||(it.aired&&it.aired.prop&&it.aired.prop.from&&it.aired.prop.from.year),syn:(it.synopsis||\'\').trim(),type:it.type,eps:it.episodes||it.chapters,\n genres:(it.genres||[]).map(function(g){return g.name}).join(\', \'),studio:(it.studios||[]).map(function(g){return g.name}).join(\', \')}}\nfunction fin(a){return uniq(a.filter(function(m){return m&&m.idMal&&!m.isAdult}).map(alm))}\nfunction season(){var d=new Date();return{s:[\'WINTER\',\'SPRING\',\'SUMMER\',\'FALL\'][Math.floor(d.getMonth()/3)],y:d.getFullYear()}}\nfunction dayRange(day){var n=new Date(),tm=(n.getDay()+6)%7,d=new Date(n.getFullYear(),n.getMonth(),n.getDate()+DAYS.indexOf(day)-tm),a=Math.floor(d.getTime()/1000);return[a-1,a+86400]}\nvar STOP={moi:1,quand:1,que:1,qui:1,les:1,des:1,une:1,dans:1,sur:1,pour:1,par:1,avec:1,mon:1,mes:1,son:1,ses:1,est:1,sont:1,the:1,and:1,anime:1,manga:1,saison:1};\nfunction kws(q){return q.toLowerCase().normalize(\'NFD\').replace(/[\\u0300-\\u036f]/g,\'\').replace(/[^a-z0-9\\s]/g,\' \').split(/\\s+/).filter(function(w){return w.length>2&&!STOP[w]}).map(function(w){return/^reincarn/.test(w)?\'reincarnated\':w})}\nfunction alQ(q,sort){return AL(\'query($q:String){Page(page:1,perPage:30){media(type:ANIME,isAdult:false,search:$q,sort:\'+sort+\'){\'+MF+\'}}}\',{q:q}).then(function(d){return fin(d.Page.media)})}\nfunction srch(q){return alQ(q,\'SEARCH_MATCH\').then(function(l){if(l.length)return l;var k=kws(q);if(!k.length)return[];\n return alQ(k.join(\' \'),\'SEARCH_MATCH\').then(function(l2){if(l2.length)return l2;\n  return Promise.all(k.map(function(w){return alQ(w,\'POPULARITY_DESC\').catch(function(){return[]})})).then(function(arr){var sc={},by={};arr.forEach(function(a){a.forEach(function(m){by[m.id]=m;sc[m.id]=(sc[m.id]||0)+1})});\n   return Object.keys(by).map(function(i){return by[i]}).sort(function(a,b){return sc[b.id]-sc[a.id]})})})})}\nfunction alList(kind,o,pg){\n if(kind==\'search\')return srch(o.q||\'\');\n if(kind==\'planning\'){var r=dayRange(o.day||\'monday\');return AL(\'query($a:Int,$b:Int){Page(perPage:50){airingSchedules(airingAt_greater:$a,airingAt_lesser:$b,sort:TIME){media{\'+MF+\'}}}}\',{a:r[0],b:r[1]}).then(function(d){return fin(d.Page.airingSchedules.map(function(x){return x.media}))})}\n var v={p:pg,t:kind==\'manga\'?\'MANGA\':\'ANIME\'},decl=\'$p:Int,$t:MediaType\',args=\'type:$t,isAdult:false\',sort=\'POPULARITY_DESC\';\n if(kind==\'saison\'){var z=season();v.s=z.s;v.y=z.y;decl+=\',$s:MediaSeason,$y:Int\';args+=\',season:$s,seasonYear:$y\'}\n else if(kind==\'top\'){sort=\'SCORE_DESC\';args+=\',popularity_greater:30000\'}\n else if(kind==\'manga\'){sort=\'SCORE_DESC\';args+=\',popularity_greater:10000\'}\n else if(kind==\'trend\')sort=\'TRENDING_DESC\';\n else if(kind==\'explore\'){sort=o.sort||\'POPULARITY_DESC\';args+=\',popularity_greater:3000\';if(o.genre){v.g=o.genre;decl+=\',$g:String\';args+=\',genre:$g\'}if(o.year){v.a=o.year*10000;v.b=o.year*10000+10000;decl+=\',$a:FuzzyDateInt,$b:FuzzyDateInt\';args+=\',startDate_greater:$a,startDate_lesser:$b\'}if(o.min){v.m=+o.min*10;decl+=\',$m:Int\';args+=\',averageScore_greater:$m\'}}\n  return AL(\'query(\'+decl+\'){Page(page:$p,perPage:30){media(\'+args+\',sort:\'+sort+\'){\'+MF+\'}}}\',v).then(function(d){return fin(d.Page.media)})}\nfunction jkList(kind,o,pg){\n var P={saison:\'/seasons/now?limit=24&sfw=true&page=\'+pg,trend:\'/seasons/now?limit=14&sfw=true\',explore:\'/top/anime?limit=25&sfw=true&page=\'+pg,top:\'/top/anime?limit=25&sfw=true&page=\'+pg,manga:\'/top/manga?limit=24&sfw=true&page=\'+pg,\n  planning:\'/schedules?filter=\'+(o.day||\'monday\')+\'&limit=24&sfw=true\',search:\'/anime?q=\'+encodeURIComponent(o.q||\'\')+\'&limit=12&sfw=true&order_by=popularity\'};\n return get(JK+P[kind]).then(function(d){return uniq((d.data||[]).map(nm))})}\nfunction L(kind,o){o=o||{};var pg=o.page||1;\n return cache([kind,o.day||\'\',pg,o.q||\'\',o.genre||\'\',o.year||\'\',o.sort||\'\',o.min||\'\'].join(\'|\'),30,function(){\n  return alList(kind,o,pg).then(function(l){if(!l.length&&kind!=\'search\')throw new Error(\'liste vide\');return l}).catch(function(e1){return jkList(kind,o,pg).catch(function(e2){throw new Error(\'AniList : \'+e1.message+\' · Jikan : \'+e2.message)})})})}\nfunction M(id,kind){return cache(\'m\'+kind+id,60,function(){\n return AL(\'query($i:Int,$t:MediaType){Media(idMal:$i,type:$t){\'+MF+\' nextAiringEpisode{airingAt episode} trailer{id site} characters(perPage:10,sort:ROLE){nodes{name{full} image{medium}}}}}\',{i:id,t:kind==\'manga\'?\'MANGA\':\'ANIME\'}).then(function(d){var x=d.Media,m=alm(x);\n  m.next=x.nextAiringEpisode||null;m.trailer=x.trailer&&x.trailer.site==\'youtube\'?\'https://youtu.be/\'+x.trailer.id:\'\';m.chars=x.characters.nodes.map(function(c){return{title:c.name.full,img:c.image.medium}});return m})\n .catch(function(e1){return get(JK+\'/\'+(kind==\'manga\'?\'manga\':\'anime\')+\'/\'+id).then(function(d){var m=nm(d.data);m.trailer=(d.data.trailer||{}).url||\'\';m.chars=[];\n  if(kind==\'manga\')return m;return get(JK+\'/anime/\'+id+\'/characters\').then(function(c){m.chars=(c.data||[]).slice(0,10).map(function(x){return{title:x.character.name,img:x.character.images.jpg.image_url}});return m}).catch(function(){return m})})})})}\nfunction skI(n){var h=\'\';for(var i=0;i<n;i++)h+=\'<div class="tile"><div class="sk" style="aspect-ratio:2/3;border-radius:14px"></div><div class="sk" style="height:10px;margin-top:6px;width:70%"></div></div>\';return h}\nfunction skT(n){return\'<div class="grid">\'+skI(n)+\'</div>\'}\nfunction skC(n){var h=\'\';for(var i=0;i<n;i++)h+=\'<div class="st"><div class="sk" style="width:72px;height:72px;border-radius:50%"></div></div>\';return h}\nfunction tileItems(l,k){return l.map(function(m){return\'<a class="tile" href="/serie/\'+m.id+(k==\'manga\'?\'?k=manga\':\'\')+\'"><img src="\'+esc(m.img)+\'" loading="lazy" alt="">\'+(m.score?\'<small>★ \'+m.score+\'</small>\':\'\')+\'<b>\'+esc(m.title)+\'</b></a>\'}).join(\'\')}\nfunction tiles(l,k){return l.length?\'<div class="grid">\'+tileItems(l,k)+\'</div>\':\'<p class="mut" style="text-align:center">Aucun résultat.</p>\'}\nfunction rings(l){return l.map(function(m){return\'<a class="st" href="/serie/\'+m.id+\'"><div class="ring"><img src="\'+esc(m.img)+\'" alt="" loading="lazy"></div><span>\'+esc(m.title)+\'</span></a>\'}).join(\'\')}\nfunction posters(l){return l.map(function(m){return\'<a class="st" style="width:96px" href="/serie/\'+m.id+\'"><img src="\'+esc(m.img)+\'" alt="" loading="lazy" style="border-radius:14px;aspect-ratio:2/3;border:0;object-fit:cover;width:100%"><span>\'+esc(m.title)+\'</span></a>\'}).join(\'\')}\nfunction fail(el,e){el.innerHTML=\'<p class="mut" style="grid-column:1/-1;text-align:center;padding:14px">Sources injoignables.<br><small>\'+esc(e&&e.message||e)+\'</small><br><a href="" style="color:var(--or)">Réessayer</a> · <a href="/diagnostic" style="color:var(--or)">Diagnostic</a></p>\'}\n\nfunction dur(s){s=Math.max(0,s);var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+\' j \'+h+\' h\':h?h+\' h \'+m+\' min\':m+\' min\'}\nfunction NX(ids){if(!ids.length)return Promise.resolve({});return cache(\'nx|\'+ids.join(\',\'),30,function(){\n return AL(\'query($i:[Int]){Page(perPage:50){media(idMal_in:$i,type:ANIME){idMal title{romaji english} coverImage{large} nextAiringEpisode{airingAt episode}}}}\',{i:ids.slice(0,50)}).then(function(d){var o={};\n  d.Page.media.forEach(function(m){if(m.nextAiringEpisode)o[m.idMal]={at:m.nextAiringEpisode.airingAt,ep:m.nextAiringEpisode.episode,title:m.title.english||m.title.romaji,img:m.coverImage.large}});return o})})}\n\nfunction fx(b,t){b.innerHTML=\'\';var m={sakura:[\'🌸\',\'fall\'],stars:[\'✨\',\'twk\'],snow:[\'❄️\',\'fall\'],flames:[\'🔥\',\'rise\']}[t];if(!m||(window.matchMedia&&matchMedia(\'(prefers-reduced-motion: reduce)\').matches))return;\n for(var i=0;i<16;i++){var e=document.createElement(\'span\');e.className=\'fxp \'+m[1];e.textContent=m[0];e.style.left=(Math.random()*94)+\'%\';e.style.fontSize=(10+Math.random()*14)+\'px\';\n  e.style.animationDuration=(4+Math.random()*6)+\'s\';e.style.animationDelay=(-Math.random()*8)+\'s\';if(m[1]==\'twk\')e.style.top=(Math.random()*85)+\'%\';b.appendChild(e)}}\n'
 
 def ensure_admin():
