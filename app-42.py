@@ -7,6 +7,7 @@ Render : fichier autonome — remplace simplement app.py, rien d'autre à modifi
   Facultatif : SECRET_KEY (sinon dérivée de DATABASE_URL), ADMIN_USERNAME / ADMIN_PASSWORD
   (sinon crée l'administrateur sur la page /installation), SENPAIX_DEBUG=1 (détails dans /healthz?db=1).
   Le pilote Postgres (psycopg2) s'installe tout seul s'il manque ; gunicorn n'est pas obligatoire.
+  APP_GATE=0 désactive l'obligation d'installer l'application avant de se connecter / s'inscrire (par défaut : obligatoire).
 """
 import os, io, re, json, time, random, sqlite3, secrets, logging, threading
 import urllib.request, urllib.parse, urllib.error, ssl
@@ -380,7 +381,7 @@ def toint(v, d=0, lo=0, hi=100000):
 # les pages légales et les aperçus des liens partagés (défi, carte). Pour désactiver : variable d'environnement LOGIN_WALL=0.
 WALL = os.environ.get("LOGIN_WALL", "1") != "0"
 PUBLIC_ENDPOINTS = {"index", "login", "register", "forgot", "logout", "setup", "healthz", "robots", "icon_png", "manifest", "sw", "privacy_page", "terms_page", "about",
-                    "api_pseudo", "diagnostic", "duel_page", "card_page", "static"}
+                    "api_pseudo", "diagnostic", "duel_page", "card_page", "static", "install_page"}
 
 
 @app.before_request
@@ -392,6 +393,25 @@ def login_wall():
     if request.method != "GET":
         return redirect("/connexion")
     return redirect("/connexion?next=" + urllib.parse.quote(request.full_path.rstrip("?")))
+
+
+# ───────────── Installation obligatoire (PWA) avant connexion / inscription ─────────────
+# Parcours : Accueil -> /installer (installer l'appli) -> ouvrir l'appli -> Connexion / Inscription.
+# L'appli installée se reconnaît côté navigateur (display-mode: standalone) : un petit script pose alors le cookie « sx_app ».
+# Les membres déjà connectés ne sont pas concernés. Pour désactiver : variable d'environnement APP_GATE=0.
+APP_GATE = os.environ.get("APP_GATE", "1") != "0"
+GATED = {"login", "register", "forgot"}
+
+
+def app_installed():
+    return request.cookies.get("sx_app") == "1"
+
+
+@app.before_request
+def install_gate():
+    if not APP_GATE or request.endpoint not in GATED or not READY["ok"] or app_installed() or me():
+        return None
+    return redirect("/installer")
 
 
 def login_required(fn):
@@ -484,6 +504,51 @@ def ic(name, size=22):
                   f'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="{ICONS[name]}"/></svg>')
 
 
+def nav(where="menu"):
+    """Source unique du menu ⋮ et de la page Paramètres : mêmes groupes, même ordre, mêmes icônes, même surbrillance."""
+    u, p = me(), request.path
+
+    def it(icon, label, sub="", href="", only="", **k):
+        return dict(icon=icon, label=label, sub=sub, href=href, only=only, on=(p == href), **k)
+
+    G = []
+    if u:
+        n = u["username"]
+        G.append(("Mon compte", [
+            it("user", "Mon profil", "Voir ma page", "/profil/" + n),
+            it("image", "Ma carte Otaku", "", "/carte/" + n),
+            it("edit", "Personnaliser mon profil", "Photo, bannière, animations", "/profil/modifier"),
+            it("msg", "Messages", "", "/messages"),
+            it("star", "Ma liste de suivi", "À voir · En cours · Terminé", "/liste"),
+            it("lock", "Utilisateurs bloqués", "", "/bloques", only="settings")]))
+        adm = []
+        if is_admin():
+            adm.append(it("shield", "Modération", "", "/admin"))
+        if not admin_exists():
+            adm.append(it("shield", "Devenir administrateur", "", "/installation"))
+        G.append(("Administration", adm))
+        G.append(("Explorer", [it("compass", "Catalogue", "", "/catalogue", only="menu"),
+                               it("search", "Recherche", "", "/recherche", only="menu")]))
+    else:
+        G.append(("", [it("out", "Connexion", "", "/connexion"), it("user", "Créer un compte", "", "/inscription")]))
+    G.append(("Application", ([it("sliders", "Paramètres", "Thème, notifications, confidentialité", "/parametres", only="menu")] if u else []) + [
+        it("dl", "Installer l'application", "Accès direct depuis l'écran d'accueil", "", act="install"),
+        it("chart", "Diagnostic", "État des sources de données", "/diagnostic")]))
+    G.append(("Aide & légal", [
+        it("info", "À propos de SenpaiX", "", "/a-propos"),
+        it("lock", "Politique de confidentialité", "", "/confidentialite"),
+        it("shield", "Conditions d'utilisation", "", "/conditions"),
+        it("mail", "E-mail", EMAIL, "mailto:" + EMAIL, only="settings"),
+        it("msg", "WhatsApp", WA_SHOW, "https://wa.me/" + WA, only="settings", ext=True),
+        it("users", "Facebook", "", FB, only="settings", ext=True)]))
+    out = []
+    for t, its in G:
+        its = [i for i in its if i["only"] in ("", where)]
+        if its:
+            out.append(dict(t=t, items=its))
+    return out
+
+
 @app.context_processor
 def inject():
     u = me()
@@ -496,7 +561,7 @@ def inject():
         except DBError:
             log.exception("inject : compteur de notifications")
             safe_rollback()
-    return dict(setup_open=bool(u) and not admin_exists(), durable=DURABLE, STATUSES=STATUSES, REASONS=REASONS, is_admin=is_admin(), me=u, ic=ic, ava=ava, ago=ago, unread=unread, gunread=gunread, path=request.path,
+    return dict(setup_open=bool(u) and not admin_exists(), durable=DURABLE, STATUSES=STATUSES, REASONS=REASONS, is_admin=is_admin(), me=u, ic=ic, nav=nav, ava=ava, ago=ago, unread=unread, gunread=gunread, path=request.path,
                 csrf=lambda: Markup(f'<input type="hidden" name="_csrf" value="{session.setdefault("csrf", secrets.token_hex(16))}">'))
 
 
@@ -510,6 +575,8 @@ def small_posts():
 
 @app.before_request
 def csrf_guard():
+    if request.path == "/deconnexion":   # se déconnecter doit toujours marcher (jeton périmé, autre onglet, page en cache…)
+        return None
     if request.method == "POST":
         if request.path.startswith("/api/"):
             if not secrets.compare_digest(request.headers.get("X-CSRF", ""), session.get("csrf", "x")):
@@ -545,7 +612,7 @@ def uid():
 @app.route("/")
 def index():
     if WALL and not me():
-        return render_template("landing.html", title="Bienvenue", bare=True)
+        return render_template("landing.html", title="Bienvenue", bare=True, installed=app_installed() or not APP_GATE)
     tab = request.args.get("t", "decouverte")
     conds, args = ["p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id=?)"], [uid(), uid()]
     if tab == "suivis" and me():
@@ -1822,7 +1889,7 @@ def settings():
     d, f, u = db(), request.form, me()
     if request.method == "POST":
         a = f.get("action")
-        if a == "prefs":
+        if a == "profile":
             em = txt(f.get("email"), 120).lower()
             if em and not EMAIL_RE.fullmatch(em):
                 flash("Adresse e-mail invalide.", "err")
@@ -1830,10 +1897,8 @@ def settings():
             if em and d.execute("SELECT 1 FROM users WHERE email=? AND id!=?", (em, u["id"])).fetchone():
                 flash("Cet e-mail est déjà utilisé.", "err")
                 return redirect("/parametres")
-            d.execute("UPDATE users SET bio=?,email=?,theme=?,notify=?,privacy=?,dm=? WHERE id=?",
-                      (txt(f.get("bio"), 300), em, "light" if f.get("theme") == "light" else "dark", int(bool(f.get("notify"))),
-                       "private" if f.get("privacy") else "public", "all" if f.get("dm") else "none", u["id"]))
-            flash("Paramètres enregistrés.", "ok")
+            d.execute("UPDATE users SET bio=?,email=? WHERE id=?", (txt(f.get("bio"), 300), em, u["id"]))
+            flash("Profil enregistré.", "ok")
         elif a == "regen":
             if throttle(f"rg{u['id']}", 5, 600) and check_password_hash(u["pw"], f.get("password", "")[:128]):
                 code = new_code()
@@ -1865,7 +1930,21 @@ def settings():
                 return redirect("/")
             flash("Pseudo ou mot de passe incorrect.", "err")
         return redirect("/parametres")
-    return render_template("settings.html", title="Paramètres", wa=WA, wa_show=WA_SHOW, email=EMAIL, fb=FB)
+    return render_template("settings.html", title="Paramètres", back="/", wa=WA, wa_show=WA_SHOW, email=EMAIL, fb=FB)
+
+
+@app.route("/api/parametres", methods=["POST"])
+@login_required
+def api_pref():
+    """Enregistre UN réglage à la fois (interrupteurs du menu et des Paramètres) : tout reste synchronisé."""
+    u, j = me(), request.get_json(silent=True) or {}
+    on = bool(j.get("value"))
+    col = {"theme": ("theme", "light" if on else "dark"), "notify": ("notify", int(on)),
+           "privacy": ("privacy", "private" if on else "public"), "dm": ("dm", "all" if on else "none")}.get(j.get("name"))
+    if not col:
+        return jsonify(ok=False), 400
+    db().execute(f"UPDATE users SET {col[0]}=? WHERE id=?", (col[1], u["id"]))
+    return jsonify(ok=True)
 
 
 @app.route("/export", methods=["POST"])
@@ -1950,6 +2029,13 @@ def welcome():
 
 
 DUMMY = generate_password_hash("x" + secrets.token_hex(6))
+
+
+@app.route("/installer")
+def install_page():
+    if me():
+        return redirect("/")
+    return render_template("install.html", title="Installer l'application", bare=True, gate=APP_GATE)
 
 
 @app.route("/connexion", methods=["GET", "POST"])
@@ -2503,6 +2589,14 @@ html[data-theme=light] .pill.on{background:#14182b;color:#fff}
 .it .ico{width:34px;height:34px;border-radius:10px;background:var(--card2);color:var(--or);display:flex;align-items:center;justify-content:center;flex:none}
 .it small{display:block;color:var(--mut);font-size:.74rem;font-weight:400}.it .grow{font-size:.95rem}.it .ic:last-child{color:var(--mut)}
 .sec{color:var(--mut);font-size:.72rem;font-weight:800;letter-spacing:.8px;text-transform:uppercase;margin:20px 6px 6px}
+.dots{background:none;color:inherit;display:flex;padding:2px;border:0}
+.dov{position:fixed;inset:0;z-index:60;background:#000a;opacity:0;transition:opacity .25s}.dov.open{opacity:1}
+.drw{position:fixed;top:0;right:0;bottom:0;z-index:61;width:min(88vw,360px);background:var(--bg);border-left:1px solid var(--line);transform:translateX(105%);transition:transform .26s cubic-bezier(.2,.8,.2,1);display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);box-shadow:-12px 0 40px #0008}.drw.open{transform:none}
+.dh{display:flex;align-items:center;gap:8px;padding:14px;border-bottom:1px solid var(--line)}.dh a.row{min-width:0;flex:1}.dh small{display:block}
+.dh .dx{background:var(--card2);color:var(--text);width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex:none;padding:0;border:0;font-size:.9rem}
+.db{overflow-y:auto;overscroll-behavior:contain;padding:2px 14px 28px;flex:1}.db form{margin:0}.db .sec:first-child{margin-top:12px}
+a.it.on{background:var(--card2)}a.it.on .grow{color:var(--or2)}
+.sxt{position:fixed;left:50%;bottom:calc(92px + env(safe-area-inset-bottom));transform:translate(-50%,20px);background:var(--card2);border:1px solid var(--line);color:var(--text);padding:9px 16px;border-radius:99px;font:600 .84rem sans-serif;opacity:0;pointer-events:none;transition:.25s;z-index:80;box-shadow:0 8px 28px #0008}.sxt.show{opacity:1;transform:translate(-50%,0)}.sxt.bad{background:var(--red);color:#fff}
 .sw{position:relative;width:48px;height:28px;flex:none;margin:0}.sw input{opacity:0;width:100%;height:100%;position:absolute;margin:0;z-index:2}
 .sw i{position:absolute;inset:0;border-radius:99px;background:var(--card2);border:1px solid var(--line);transition:.2s}.sw i:after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.2s}
 .sw input:checked+i{background:var(--or);border-color:var(--or)}.sw input:checked+i:after{transform:translateX(20px)}
@@ -2551,6 +2645,7 @@ html[data-theme=light] .pill.on{background:#14182b;color:#fff}
 .cbar [hidden]{display:none!important}
 .wl{min-height:82vh;display:flex;flex-direction:column;justify-content:center;text-align:center}.wlogo{font-size:2.2rem;font-weight:800}.wlogo b{color:var(--or)}
 .wl h1{font-size:2.3rem;line-height:1.1;margin:18px 0 10px}.wl .or{color:var(--or)}.wfoot{margin-top:28px;font-size:.8rem;color:var(--mut)}.wfoot a{color:var(--mut)}
+.inst{max-width:440px;margin:4vh auto 30px;text-align:center}.inst h1{font-size:1.7rem;margin:14px 0 6px}.inst ol{list-style:none;margin:18px 0 0;padding:0;text-align:left;counter-reset:s}.inst li{counter-increment:s;display:flex;gap:12px;align-items:flex-start;padding:12px 14px;margin-bottom:10px;border-radius:14px;background:var(--card,rgba(255,255,255,.06))}.inst li:before{content:counter(s);flex:none;width:26px;height:26px;border-radius:50%;background:var(--or);color:#fff;font-weight:800;display:flex;align-items:center;justify-content:center;font-size:.85rem}.inst li small{display:block;color:var(--mut);margin-top:2px}.inst .ok{color:#4cd18a;font-weight:700}.inst .warn{background:rgba(255,106,26,.14);border-radius:12px;padding:10px 12px;margin:12px 0;text-align:left;font-size:.9rem}
 .rkm{margin:10px 0}.rke{font-size:2rem}.rkm .meter{margin:10px 0 6px}.rkm .meter i{background:linear-gradient(90deg,var(--or),var(--or2))}
 .xpr summary{cursor:pointer;color:var(--or2);font-weight:600;font-size:.85rem;margin:2px 0 8px}.xpr ul{margin:0 0 10px;padding:0;list-style:none}.xpr li{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);font-size:.88rem}.xpr li b{color:var(--or2)}
 .dfh{text-align:center;margin:6px 0 12px}.dfb{font-size:2.6rem}
@@ -2639,22 +2734,32 @@ POST_MACRO = r"""{% macro flag(kind, id, username) %}{% if me and me.username!=u
 {% macro tiles(data) %}<div class="grid">{% for m in data %}<a class="tile" href="/serie/{{ m.id }}"><img src="{{ m.img }}" loading="lazy" alt="">{% if m.score %}<small>★ {{ m.score }}</small>{% endif %}<b>{{ m.title }}</b></a>{% endfor %}</div>{% if not data %}<p class="mut" style="text-align:center">Aucun résultat — la source (Jikan) est peut-être occupée, réessaie.<br><small>{{ err }}</small> <a href="/diagnostic" style="color:var(--or)">Diagnostic</a></p>{% endif %}{% endmacro %}
 {% macro item(icon, label, sub='', href='') %}{% if href %}<a href="{{ href }}" class="it"><span class="ico">{{ ic(icon,19) }}</span><span class="grow">{{ label }}{% if sub %}<small>{{ sub }}</small>{% endif %}</span>{{ ic('chev',18) }}</a>{% else %}<div class="it"><span class="ico">{{ ic(icon,19) }}</span><span class="grow">{{ label }}{% if sub %}<small>{{ sub }}</small>{% endif %}</span></div>{% endif %}{% endmacro %}
 {% macro sw(name, on, label, sub='', icon='bell') %}<label class="it" style="margin:0"><span class="ico">{{ ic(icon,19) }}</span><span class="grow">{{ label }}{% if sub %}<small>{{ sub }}</small>{% endif %}</span><span class="sw"><input type="checkbox" name="{{ name }}" {{ 'checked' if on }}><i></i></span></label>{% endmacro %}
+{% macro navlist(groups) %}{% for g in groups %}{% if g.t %}<div class="sec">{{ g.t }}</div>{% endif %}<div class="grp">{% for i in g['items'] %}{% if i.act == 'install' %}<a href="#" class="it js-install" onclick="installApp();return false">{% else %}<a href="{{ i.href }}" class="it{{ ' on' if i.on }}"{% if i.ext %} target="_blank" rel="noopener"{% endif %}>{% endif %}<span class="ico">{{ ic(i.icon,19) }}</span><span class="grow">{{ i.label }}{% if i.sub %}<small>{{ i.sub }}</small>{% endif %}</span>{{ ic('chev',18) }}</a>{% endfor %}</div>{% endfor %}{% endmacro %}
+{% macro pref(name, on, label, sub='', icon='bell') %}<label class="it" style="margin:0"><span class="ico">{{ ic(icon,19) }}</span><span class="grow">{{ label }}{% if sub %}<small>{{ sub }}</small>{% endif %}</span><span class="sw"><input type="checkbox" data-pref="{{ name }}" {{ 'checked' if on }} onchange="sxPref(this)"><i></i></span></label>{% endmacro %}
 {% macro cd(eta) %}<div class="cd" data-eta="{{ eta }}"><div><b>00</b><small>Jours</small></div><div><b>00</b><small>Heures</small></div><div><b>00</b><small>Min</small></div><div><b>00</b><small>Sec</small></div></div>
 <script>(function(){var e=document.currentScript.previousElementSibling,t=+e.dataset.eta,s=Date.now();function f(){var r=Math.max(0,t-Math.floor((Date.now()-s)/1000)),v=[Math.floor(r/86400),Math.floor(r%86400/3600),Math.floor(r%3600/60),r%60];e.querySelectorAll('b').forEach(function(b,i){b.textContent=String(v[i]).padStart(2,'0')})}f();setInterval(f,1000)})()</script>{% endmacro %}"""
 
 T = {}
 T["m.html"] = POST_MACRO
-T["base.html"] = r"""<!doctype html><html lang="fr" data-theme="{{ me.theme if me else 'dark' }}"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#070b1a"><link rel="manifest" href="/manifest.json"><link rel="apple-touch-icon" href="/icon-192.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><title>{{ title }} · SenpaiX</title>{% block head %}{% endblock %}<style>{{ css|safe }}</style><script>{{ js|safe }}</script></head><body>
+T["base.html"] = r"""{% from "m.html" import navlist, pref with context %}<!doctype html><html lang="fr" data-theme="{{ me.theme if me else 'dark' }}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#070b1a"><link rel="manifest" href="/manifest.json"><link rel="apple-touch-icon" href="/icon-192.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><title>{{ title }} · SenpaiX</title>{% block head %}{% endblock %}<style>{{ css|safe }}</style><script>{{ js|safe }}</script><script>(function(){window.sxSet=function(){try{document.cookie="sx_app=1;path=/;max-age=31536000;SameSite=Lax"+(location.protocol=="https:"?";Secure":"")}catch(e){}};var s=false;try{s=["standalone","fullscreen","minimal-ui"].some(function(m){return matchMedia("(display-mode: "+m+")").matches})||navigator.standalone===true||document.referrer.indexOf("android-app://")==0}catch(e){}window.SX_APP=s;if(s&&document.cookie.indexOf("sx_app=1")<0)window.sxSet()})()</script></head><body>
 {% if not bare %}<header><div class="top">{% if back %}<a href="{{ back }}">{{ ic('back') }}</a>{% elif me %}<a href="/profil/{{ me.username }}">{{ ava(me.username,34) }}</a>{% endif %}
 <a class="logo" href="/">Senpai<b>X</b></a><span class="sp"></span>{% if me %}<a href="/recherche">{{ ic('search') }}</a>{% endif %}
 {% if me %}<a class="b" href="/notifications">{{ ic('bell') }}{% if unread %}<i>{{ unread }}</i>{% endif %}</a>{% endif %}
-<details class="menu"><summary>{{ ic('dots',24) }}</summary><div class="mn">{% if me %}<a href="/profil/{{ me.username }}">{{ ic('user',18) }} Mon profil</a><a href="/carte/{{ me.username }}">{{ ic('image',18) }} Ma carte Otaku</a><a href="/messages">{{ ic('msg',18) }} Messages</a><a href="/parametres">{{ ic('sliders',18) }} Paramètres</a>{% else %}<a href="/connexion">{{ ic('out',18) }} Connexion</a><a href="/inscription">{{ ic('user',18) }} Créer un compte</a>{% endif %}
-{% if me %}<a href="/liste">{{ ic('star',18) }} Ma liste</a>{% endif %}{% if setup_open %}<a href="/installation">{{ ic('shield',18) }} Devenir administrateur</a>{% endif %}{% if me %}<a href="/catalogue">{{ ic('compass',18) }} Catalogue</a>{% endif %}{% if is_admin %}<a href="/admin">{{ ic('shield',18) }} Modération</a>{% endif %}<a href="#" onclick="installApp();return false">{{ ic('dl',18) }} Installer l'app</a><a href="/a-propos">{{ ic('info',18) }} À propos</a><a href="/confidentialite">{{ ic('lock',18) }} Confidentialité</a><a href="/conditions">{{ ic('shield',18) }} Conditions</a><a href="/diagnostic">{{ ic('sliders',18) }} Diagnostic</a>{% if me %}<form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button>{{ ic('out',18) }} Se déconnecter</button></form>{% endif %}</div></details></div></header>{% endif %}
+<button type="button" class="dots" aria-label="Menu" onclick="sxMenu(true)">{{ ic('dots',24) }}</button></div></header>
+<div class="dov" id="sxov" hidden onclick="sxMenu(false)"></div>
+<aside class="drw" id="sxdrw" aria-hidden="true"><div class="dh">{% if me %}<a class="row" href="/profil/{{ me.username }}">{{ ava(me.username,46) }}<span class="grow"><b>{{ me.username }}</b><small class="mut">Voir mon profil</small></span></a><a class="dx" href="/parametres" aria-label="Paramètres">{{ ic('sliders',18) }}</a>{% else %}<a class="logo grow" href="/">Senpai<b>X</b></a>{% endif %}<button type="button" class="dx" aria-label="Fermer" onclick="sxMenu(false)">&#10005;</button></div>
+<div class="db">{% if me %}<div class="sec">Réglages rapides</div><div class="grp">{{ pref('theme', me.theme=='light', 'Thème clair', '', 'compass') }}{{ pref('notify', me.notify, 'Notifications', '', 'bell') }}</div>{% endif %}{{ navlist(nav('menu')) }}
+{% if me %}<div class="grp" style="margin-top:18px"><form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button class="it">{{ ic('out',19) }}<span class="grow">Se déconnecter</span></button></form></div>{% endif %}</div></aside>{% endif %}
 <main>{% if is_admin and not durable %}<a class="flash err" href="/admin" style="display:block">⚠️ Stockage temporaire : les données seront effacées à la prochaine mise à jour. Touche ici pour voir comment corriger.</a>{% endif %}{% for c,m in get_flashed_messages(with_categories=true) %}<div class="flash {{ c }}">{{ m }}</div>{% endfor %}{% block c %}{% endblock %}</main>
 {% if not bare and me %}<nav class="tabs"><div>{% for h,i,l in [('/','home','Découverte'),('/communautes','users','Groupes'),('/quiz','game','Quiz'),('/catalogue','compass','Catalogue'),('/profil/'+me.username if me else '/connexion','user','Profil')] %}
 <a href="{{ h }}" class="{{ 'on' if (path==h or (h!='/' and path.startswith(h[:6]))) }} {{ 'mid' if i=='game' }}">{{ ic(i) }}{{ l }}{% if i=='users' and gunread %}<b class="nb">{{ gunread if gunread<100 else '99+' }}</b>{% endif %}</a>{% endfor %}</div></nav>{% endif %}{% if me %}<script>setInterval(function(){if(document.hidden)return;fetch('/api/groupes/non-lus',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){var a=document.querySelector('.tabs a[href="/communautes"]');if(!a)return;var b=a.querySelector('.nb');if(d.n>0){if(!b){b=document.createElement('b');b.className='nb';a.appendChild(b)}b.textContent=d.n>99?'99+':d.n}else if(b)b.remove()}).catch(function(){})},40000)</script>{% endif %}<script>if('serviceWorker' in navigator)addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){})});var DP;addEventListener('beforeinstallprompt',function(e){e.preventDefault();DP=e});
 function installApp(){if(DP){DP.prompt();DP=null}else alert("Menu ⋮ du navigateur → « Installer l'application » ou « Ajouter à l'écran d'accueil ».")}</script><script>var CSRF="{{ session.get('csrf','') }}";
+function sxMenu(o){var d=document.getElementById('sxdrw'),v=document.getElementById('sxov');if(!d)return;if(o)v.hidden=false;setTimeout(function(){d.classList.toggle('open',o);v.classList.toggle('open',o)},o?10:0);d.setAttribute('aria-hidden',o?'false':'true');document.body.style.overflow=o?'hidden':'';if(!o)setTimeout(function(){if(!d.classList.contains('open'))v.hidden=true},280)}
+(function(){var d=document.getElementById('sxdrw');if(!d)return;var x0=0;d.addEventListener('touchstart',function(e){x0=e.touches[0].clientX},{passive:true});d.addEventListener('touchend',function(e){if(e.changedTouches[0].clientX-x0>70)sxMenu(false)},{passive:true});addEventListener('keydown',function(e){if(e.key==='Escape')sxMenu(false)});if(window.SX_APP)document.querySelectorAll('.js-install').forEach(function(a){a.style.display='none'})})();
+var sxT;function sxToast(m,bad){var t=document.getElementById('sxtoast');if(!t){t=document.createElement('div');t.id='sxtoast';document.body.appendChild(t)}t.textContent=m;t.className='sxt show'+(bad?' bad':'');clearTimeout(sxT);sxT=setTimeout(function(){t.className='sxt'},1800)}
+function sxApply(n,on){document.querySelectorAll('input[data-pref="'+n+'"]').forEach(function(x){x.checked=on});if(n==='theme'){document.documentElement.setAttribute('data-theme',on?'light':'dark');var m=document.querySelector('meta[name=theme-color]');if(m)m.content=on?'#f4f5fa':'#070b1a'}}
+function sxPref(el){var n=el.dataset.pref,on=el.checked;sxApply(n,on);fetch('/api/parametres',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF':CSRF},body:JSON.stringify({name:n,value:on?1:0})}).then(function(r){return r.json()}).then(function(d){if(!d.ok)throw 0;sxToast('Enregistr\u00e9 \u2713')}).catch(function(){sxApply(n,!on);sxToast('\u00c9chec, r\u00e9essaie',1)})}
 function openSheet(i){$(i).hidden=false;document.body.style.overflow='hidden'}
 function closeSheet(e){e.hidden=true;document.body.style.overflow=''}
 addEventListener('keydown',function(e){if(e.key==='Escape')document.querySelectorAll('.sheet').forEach(function(x){if(!x.hidden)closeSheet(x)})});
@@ -2808,8 +2913,37 @@ $('sh').onclick=function(){var b=this;b.disabled=true;make().then(function(c){c.
 $('cp').onclick=function(){var b=this;navigator.clipboard.writeText(C.url).then(function(){b.textContent='Lien copié ✓'})}})()</script>{% endif %}{% endblock %}"""
 
 T["landing.html"] = r"""{% extends "base.html" %}{% block c %}<div class="wl"><div class="wlogo">Senpai<b>X</b></div><h1>L'univers <span class="or">Otaku</span> autrement.</h1>
-<p class="mut" style="margin:0 0 22px">Quiz, défis, groupes, séries… Connecte-toi pour entrer dans la communauté.</p><a class="btn w" href="/connexion">Se connecter</a><p style="margin:10px 0 0"><a class="btn g w" href="/inscription">Créer un compte</a></p>
-<div class="wfoot"><a href="/a-propos">À propos</a> · <a href="/confidentialite">Confidentialité</a> · <a href="/conditions">Conditions</a></div></div>{% endblock %}"""
+<div id="lin" {{ 'hidden' if installed }}><p class="mut" style="margin:0 0 22px">Quiz, défis, groupes, séries… Installe l'application gratuite pour entrer dans la communauté.</p><a class="btn w" href="/installer">📲 Installer l'application</a><p class="mut" style="margin:12px 0 0;font-size:.85rem">Déjà installée ? Ouvre SenpaiX depuis l'icône de ton écran d'accueil.</p></div>
+<div id="lau" {{ 'hidden' if not installed }}><p class="mut" style="margin:0 0 22px">Quiz, défis, groupes, séries… Connecte-toi pour entrer dans la communauté.</p><a class="btn w" href="/connexion">Se connecter</a><p style="margin:10px 0 0"><a class="btn g w" href="/inscription">Créer un compte</a></p></div>
+<div class="wfoot"><a href="/a-propos">À propos</a> · <a href="/confidentialite">Confidentialité</a> · <a href="/conditions">Conditions</a></div></div>
+<script>(function(){if(window.SX_APP){document.getElementById('lin').hidden=true;document.getElementById('lau').hidden=false}})()</script>{% endblock %}"""
+
+T["install.html"] = r"""{% extends "base.html" %}{% block c %}<div class="inst"><div class="wlogo">Senpai<b>X</b></div><h1>Installe l'application</h1>
+<p class="mut" style="margin:0">{% if gate %}Pour te connecter ou créer un compte, installe d'abord SenpaiX sur ton appareil. C'est gratuit, rapide et sans passer par un magasin d'applications.{% else %}Installe SenpaiX sur ton appareil : gratuit, rapide et sans magasin d'applications.{% endif %}</p>
+<div class="warn" id="iab" hidden>⚠️ Ce navigateur intégré (Facebook, Instagram, TikTok…) ne permet pas l'installation. Ouvre ce lien dans <b>Chrome</b> ou <b>Safari</b> : <button type="button" class="btn s g" id="cpy" style="margin-left:6px">Copier le lien</button></div>
+<ol>
+<li><div><b>Installe l'application</b>
+<small id="p-ios" hidden>Appuie sur <b>Partager</b> ⬆️ (en bas de Safari), puis sur <b>« Sur l'écran d'accueil »</b>, puis <b>Ajouter</b>.</small>
+<small id="p-and" hidden>Appuie sur le bouton ci-dessous. Si rien ne s'affiche : menu <b>⋮</b> du navigateur → <b>« Installer l'application »</b>.</small>
+<small id="p-pc" hidden>Appuie sur le bouton ci-dessous, ou sur l'icône d'installation à droite de la barre d'adresse (Chrome / Edge).</small></div></li>
+<li><div><b>Ouvre SenpaiX</b><small>Lance l'application depuis l'icône sur ton écran d'accueil (ou ton bureau).</small></div></li>
+<li><div><b>Crée ton compte ou connecte-toi</b><small>Tu retrouves tes séries, tes défis et tes groupes.</small></div></li>
+</ol>
+<p style="margin:18px 0 0"><button type="button" class="btn w" id="ibtn">📲 Installer l'application</button></p>
+<p class="ok" id="iok" hidden style="margin:14px 0 0">✅ Installée ! Ouvre SenpaiX depuis ton écran d'accueil.<br><a class="btn s" href="/connexion" style="margin-top:10px;display:inline-block">Continuer</a></p>
+<div class="wfoot"><a href="/">Retour</a> · <a href="/a-propos">À propos</a> · <a href="/confidentialite">Confidentialité</a></div></div>
+<script>(function(){
+var ua=navigator.userAgent||'',ios=/iPhone|iPad|iPod/i.test(ua)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1),and=/Android/i.test(ua);
+if(window.SX_APP){location.replace('/');return}
+$(ios?'p-ios':and?'p-and':'p-pc').hidden=false;
+if(/FBAN|FBAV|Instagram|TikTok|Snapchat|MicroMessenger|Line\//i.test(ua)||(and&&/; wv\)/.test(ua)))$('iab').hidden=false;
+var cp=$('cpy');if(cp)cp.onclick=function(){var b=this;try{navigator.clipboard.writeText(location.href).then(function(){b.textContent='Copié ✓'})}catch(e){}};
+function done(){window.sxSet();$('iok').hidden=false;$('ibtn').hidden=true}
+addEventListener('appinstalled',done);
+$('ibtn').onclick=function(){
+ if(typeof DP!=='undefined'&&DP){DP.prompt();DP.userChoice.then(function(c){if(c&&c.outcome==='accepted')done()});DP=null}
+ else{var t=$(ios?'p-ios':and?'p-and':'p-pc');t.style.color='var(--or)';t.scrollIntoView({behavior:'smooth',block:'center'});
+  if(ios)alert("Sur iPhone / iPad : Partager ⬆️ → « Sur l'écran d'accueil ».")}}})()</script>{% endblock %}"""
 
 T["trl.html"] = r"""{% macro tlist(items, grid=False) %}<div class="{{ 'tgrid' if grid else 'tstrip' }}">{% for t in items %}<a class="tcard" href="https://www.youtube.com/watch?v={{ t.yt }}" target="_blank" rel="noopener" data-t="{{ t.title }}" data-m="{{ t.mal_id }}" onclick="return playTrailer('{{ t.yt }}',this)"><span class="tth"><img src="https://img.youtube.com/vi/{{ t.yt }}/mqdefault.jpg" loading="lazy" alt=""><i>▶</i></span><b>{{ t.title }}</b></a>{% endfor %}</div>{% endmacro %}
 {% macro tplayer() %}<div class="sheet tvm" id="tvm" hidden onclick="if(event.target===this)closeT()"><div class="tbox"><div class="tfr" id="tfr"></div><div class="row" style="padding:10px 4px 2px"><b class="grow" id="tti" style="min-width:0"></b><a class="btn s" id="tfi" href="#" hidden>Voir la fiche</a><button type="button" class="btn s g" onclick="closeT()">Fermer</button></div></div></div>
@@ -3098,24 +3232,18 @@ T["notifs.html"] = r"""{% extends "base.html" %}{% block c %}<div class="row"><h
 <form method="post" class="row">{{ csrf() }}<button class="btn s g" name="a" value="read">Tout lire</button><button class="btn s g" name="a" value="clear">Vider</button></form>
 <div class="grp" style="margin-top:12px">{% for n in rows %}<a class="it" href="{{ n.link }}"><span class="ico">{{ ic('bell',18) }}</span><span class="grow" style="{{ '' if n.read else 'font-weight:700' }}">{{ n.text }}<small>{{ ago(n.created) }}</small></span></a>{% else %}<div class="it mut">Rien de neuf.</div>{% endfor %}</div>{% endblock %}"""
 
-T["settings.html"] = r"""{% extends "base.html" %}{% from "m.html" import item, sw with context %}{% block c %}<h1>Paramètres</h1>
+T["settings.html"] = r"""{% extends "base.html" %}{% from "m.html" import navlist, pref with context %}{% block c %}<h1>Paramètres</h1>
 <div class="card row">{{ ava(me.username,56) }}<div class="grow"><b style="font-size:1.1rem">{{ me.username }}</b><small class="mut" style="display:block">Membre depuis {{ me.created[:10] }}</small></div><a class="btn s g" href="/profil/{{ me.username }}">Voir</a></div>
-<form method="post">{{ csrf() }}<input type="hidden" name="action" value="prefs">
-<div class="sec">Profil</div><div class="grp" style="padding:12px 16px"><label style="margin-top:0">Biographie</label><textarea name="bio" maxlength="300">{{ me.bio }}</textarea><label>E-mail (pour te connecter et récupérer ton compte)</label><input type="email" name="email" maxlength="120" value="{{ me.email or '' }}" placeholder="facultatif"></div>
-<div class="sec">Apparence</div><div class="grp">{{ sw('theme', me.theme=='light', 'Thème clair', 'Désactivé = thème sombre', 'compass') }}</div>
-<div class="sec">Notifications</div><div class="grp">{{ sw('notify', me.notify, 'Notifications', "J'aime, commentaires", 'bell') }}</div>
-<div class="sec">Confidentialité</div><div class="grp">{{ sw('privacy', me.privacy=='private', 'Profil privé', 'Seul toi vois ton profil', 'lock') }}{{ sw('dm', me.dm=='all', 'Messages privés', 'Autoriser les messages', 'msg') }}</div>
-<p><button class="btn w">Enregistrer</button></p></form>
-<div class="sec">Messages</div><div class="grp">{{ item('msg','Mes messages','','/messages') }}{{ item('star','Ma liste de suivi','À voir · En cours · Terminé','/liste') }}{{ item('user','Personnaliser mon profil','Photo, bannière, animations','/profil/modifier') }}{{ item('lock','Utilisateurs bloqués','','/bloques') }}</div>
+<div class="sec">Préférences <span style="text-transform:none;letter-spacing:0;font-weight:500">· enregistrées automatiquement</span></div><div class="grp">{{ pref('theme', me.theme=='light', 'Thème clair', 'Désactivé = thème sombre', 'compass') }}{{ pref('notify', me.notify, 'Notifications', "J'aime, commentaires", 'bell') }}{{ pref('privacy', me.privacy=='private', 'Profil privé', 'Seul toi vois ton profil', 'lock') }}{{ pref('dm', me.dm=='all', 'Messages privés', 'Autoriser les messages', 'msg') }}</div>
+<form method="post">{{ csrf() }}<input type="hidden" name="action" value="profile"><div class="sec">Profil</div><div class="grp" style="padding:12px 16px"><label style="margin-top:0">Biographie</label><textarea name="bio" maxlength="300">{{ me.bio }}</textarea><label>E-mail (pour te connecter et récupérer ton compte)</label><input type="email" name="email" maxlength="120" value="{{ me.email or '' }}" placeholder="facultatif"><p><button class="btn s">Enregistrer le profil</button></p></div></form>
+{{ navlist(nav('settings')) }}
 <div class="sec">Sécurité</div><div class="grp" style="padding:12px 16px"><form method="post">{{ csrf() }}<input type="hidden" name="action" value="password"><label style="margin-top:0">Mot de passe actuel</label><input type="password" name="old" autocomplete="current-password"><label>Nouveau (8+)</label><input type="password" name="new" autocomplete="new-password"><p><button class="btn s">Changer</button></p></form>
 <form method="post">{{ csrf() }}<input type="hidden" name="action" value="regen"><label>Code de récupération {{ '(défini)' if me.recovery else '(aucun)' }}</label><input type="password" name="password" placeholder="Ton mot de passe pour générer un nouveau code" autocomplete="current-password"><p><button class="btn s g">Générer un nouveau code</button></p></form>
 <form method="post">{{ csrf() }}<input type="hidden" name="action" value="logout_all"><button class="btn s g">Déconnecter les autres appareils</button></form></div>
-<div class="sec">Légal</div><div class="grp">{{ item('lock','Politique de confidentialité','Tes données et tes droits','/confidentialite') }}{{ item('shield',"Conditions d'utilisation",'Les règles de la communauté','/conditions') }}</div>
-<div class="sec">Contact & aide</div><div class="grp">{{ item('mail','E-mail',email,'mailto:'+email) }}{{ item('msg','WhatsApp',wa_show,'https://wa.me/'+wa) }}{{ item('users','Facebook','',fb) }}{{ item('info','À propos de SenpaiX','','/a-propos') }}</div>
 <div class="sec">Mes données</div><div class="grp"><form method="post" action="/export">{{ csrf() }}<button class="it"><span class="ico">{{ ic('dl',19) }}</span><span class="grow">Exporter mes données (JSON)</span></button></form></div>
 <div class="grp"><form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button class="it"><span class="ico">{{ ic('out',19) }}</span><span class="grow">Se déconnecter</span></button></form></div>
 <div class="sec" style="color:#ff6b81">Zone dangereuse</div><div class="grp" style="padding:12px 16px"><form method="post" onsubmit="return confirm('Supprimer définitivement ?')">{{ csrf() }}<input type="hidden" name="action" value="delete"><small class="mut">Irréversible. Tape ton pseudo et ton mot de passe.</small><input name="confirm" placeholder="Ton pseudo" style="margin:8px 0"><input type="password" name="password" placeholder="Mot de passe"><p><button class="btn s r">Supprimer mon compte</button></p></form></div>
-<p class="mut" style="text-align:center;font-size:.72rem">SenpaiX v4 · Jikan + AniList</p>{% endblock %}"""
+<p class="mut" style="text-align:center;font-size:.72rem">SenpaiX v5 · Jikan + AniList</p>{% endblock %}"""
 
 T["auth.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><div class="logo" style="font-size:2.6rem">Senpai<b>X</b></div><p class="mut" style="margin:4px 0 14px">L'univers Otaku autrement.</p>
 <div class="seg"><a class="{{ '' if reg else 'on' }}" href="/connexion">Connexion</a><a class="{{ 'on' if reg }}" href="/inscription">Inscription</a></div>
