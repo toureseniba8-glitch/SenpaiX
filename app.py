@@ -2080,9 +2080,11 @@ def forgot():
 
 @app.route("/deconnexion", methods=["POST"])
 def logout():
+    log.info("Déconnexion (membre #%s)", session.get("uid"))
     session.clear()
     resp = redirect("/")
-    resp.headers["Clear-Site-Data"] = '"cache", "storage"'   # plus rien de privé ne reste en cache sur l'appareil
+    resp.delete_cookie(app.config.get("SESSION_COOKIE_NAME", "session"), path="/", secure=PROD, httponly=True, samesite="Lax")
+    resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
@@ -2720,6 +2722,30 @@ a.it.on{background:var(--card2)}a.it.on .grow{color:var(--or2)}
 .bdg{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:10px 6px;text-align:center;opacity:.4;filter:grayscale(1)}.bdg.on{opacity:1;filter:none;border-color:#ff6a1a55}
 .bdg span{font-size:1.6rem;display:block}.bdg small{font-size:.68rem;font-weight:700;display:block;margin-top:2px}
 .zoom{position:fixed;inset:0;z-index:100;background:#000e;display:flex;align-items:center;justify-content:center;padding:10px}.zoom img{max-width:100%;max-height:100%;border-radius:8px}
+/* ───── Look « vraie application » ───── */
+html{overscroll-behavior-y:none;-webkit-text-size-adjust:100%}
+body{overscroll-behavior-y:none;touch-action:manipulation;-webkit-user-select:none;user-select:none;padding-bottom:calc(92px + env(safe-area-inset-bottom))}
+input,textarea,select,.post p,.cb p,.bubble,.mn,#rc,.flash{-webkit-user-select:text;user-select:text}
+#rc{-webkit-user-select:all;user-select:all}
+img{-webkit-user-drag:none;-webkit-touch-callout:none}
+main{animation:pg .2s ease-out}@keyframes pg{from{opacity:0;transform:translateY(8px)}}
+header{border-bottom:1px solid var(--line)}
+.top{min-height:56px;gap:12px}
+.ib2{display:flex;align-items:center;justify-content:center;width:38px;height:38px;margin-left:-8px;border-radius:50%;color:var(--text)}.ib2:active{background:var(--card2)}
+.apptitle{font:800 1.12rem/1.1 "Segoe UI",system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;max-width:52vw}
+.top>a,.top>button{transition:transform .12s}.top>a:active,.top>button:active{transform:scale(.9)}
+.tabs{border-top:1px solid var(--line);box-shadow:0 -8px 30px #0006}
+.tabs a{flex:1;max-width:84px;padding:6px 2px;border-radius:14px;transition:color .15s,transform .12s}.tabs a:active{transform:scale(.92)}
+.tabs a.on:not(.mid)::before{content:"";position:absolute;top:-7px;left:50%;width:24px;height:3px;margin-left:-12px;border-radius:0 0 4px 4px;background:var(--or)}
+.tabs a.on .ic{stroke-width:2.5}
+.tabs a.mid{flex:none;padding:12px 18px;border-radius:99px}
+.it,.gcard,.card,.pill,.btn,button,.tile,.st{transition:transform .12s,background .15s}
+.it:active{background:var(--card2)}.tile:active,.st:active{transform:scale(.96)}
+.acc summary{list-style:none;cursor:pointer}.acc summary::-webkit-details-marker{display:none}
+.acc summary .ic:last-child{transition:transform .2s}.acc[open] summary .ic:last-child{transform:rotate(90deg)}
+.acc[open] summary{border-bottom:1px solid var(--line)}.accb{padding:6px 16px 14px;border-bottom:1px solid var(--line)}.acc:last-child .accb{border-bottom:0}
+.sxt{bottom:calc(100px + env(safe-area-inset-bottom))}
+@media (display-mode:standalone){header{padding-top:max(env(safe-area-inset-top),0px)}}
 """
 
 # ───────────────────────────── Templates ─────────────────────────────
@@ -2743,18 +2769,25 @@ T = {}
 T["m.html"] = POST_MACRO
 T["base.html"] = r"""{% from "m.html" import navlist, pref with context %}<!doctype html><html lang="fr" data-theme="{{ me.theme if me else 'dark' }}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#070b1a"><link rel="manifest" href="/manifest.json"><link rel="apple-touch-icon" href="/icon-192.png"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><title>{{ title }} · SenpaiX</title>{% block head %}{% endblock %}<style>{{ css|safe }}</style><script>{{ js|safe }}</script><script>(function(){window.sxSet=function(){try{document.cookie="sx_app=1;path=/;max-age=31536000;SameSite=Lax"+(location.protocol=="https:"?";Secure":"")}catch(e){}};var s=false;try{s=["standalone","fullscreen","minimal-ui"].some(function(m){return matchMedia("(display-mode: "+m+")").matches})||navigator.standalone===true||document.referrer.indexOf("android-app://")==0}catch(e){}window.SX_APP=s;if(s&&document.cookie.indexOf("sx_app=1")<0)window.sxSet()})()</script></head><body>
-{% if not bare %}<header><div class="top">{% if back %}<a href="{{ back }}">{{ ic('back') }}</a>{% elif me %}<a href="/profil/{{ me.username }}">{{ ava(me.username,34) }}</a>{% endif %}
-<a class="logo" href="/">Senpai<b>X</b></a><span class="sp"></span>{% if me %}<a href="/recherche">{{ ic('search') }}</a>{% endif %}
+{% if not bare %}{% set is_root = path in ['/','/communautes','/quiz','/catalogue'] or (me and path=='/profil/'+me.username) %}<header><div class="top">{% if back %}<a class="ib2" href="{{ back }}" aria-label="Retour">{{ ic('back') }}</a>{% elif not is_root %}<a class="ib2" href="/" aria-label="Retour" onclick="if(history.length>1){history.back()}else{location.href='/'}return false">{{ ic('back') }}</a>{% elif me %}<a href="/profil/{{ me.username }}">{{ ava(me.username,34) }}</a>{% endif %}
+{% if is_root %}<a class="logo" href="/">Senpai<b>X</b></a>{% else %}<span class="apptitle">{{ title }}</span>{% endif %}<span class="sp"></span>{% if me %}<a href="/recherche">{{ ic('search') }}</a>{% endif %}
 {% if me %}<a class="b" href="/notifications">{{ ic('bell') }}{% if unread %}<i>{{ unread }}</i>{% endif %}</a>{% endif %}
 <button type="button" class="dots" aria-label="Menu" onclick="sxMenu(true)">{{ ic('dots',24) }}</button></div></header>
 <div class="dov" id="sxov" hidden onclick="sxMenu(false)"></div>
 <aside class="drw" id="sxdrw" aria-hidden="true"><div class="dh">{% if me %}<a class="row" href="/profil/{{ me.username }}">{{ ava(me.username,46) }}<span class="grow"><b>{{ me.username }}</b><small class="mut">Voir mon profil</small></span></a><a class="dx" href="/parametres" aria-label="Paramètres">{{ ic('sliders',18) }}</a>{% else %}<a class="logo grow" href="/">Senpai<b>X</b></a>{% endif %}<button type="button" class="dx" aria-label="Fermer" onclick="sxMenu(false)">&#10005;</button></div>
 <div class="db">{% if me %}<div class="sec">Réglages rapides</div><div class="grp">{{ pref('theme', me.theme=='light', 'Thème clair', '', 'compass') }}{{ pref('notify', me.notify, 'Notifications', '', 'bell') }}</div>{% endif %}{{ navlist(nav('menu')) }}
-{% if me %}<div class="grp" style="margin-top:18px"><form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button class="it">{{ ic('out',19) }}<span class="grow">Se déconnecter</span></button></form></div>{% endif %}</div></aside>{% endif %}
+{% if me %}<div class="grp" style="margin-top:18px"><form method="post" action="/deconnexion" onsubmit="return sxLogout(event)">{{ csrf() }}<button class="it">{{ ic('out',19) }}<span class="grow">Se déconnecter</span></button></form></div>{% endif %}</div></aside>{% endif %}
 <main>{% if is_admin and not durable %}<a class="flash err" href="/admin" style="display:block">⚠️ Stockage temporaire : les données seront effacées à la prochaine mise à jour. Touche ici pour voir comment corriger.</a>{% endif %}{% for c,m in get_flashed_messages(with_categories=true) %}<div class="flash {{ c }}">{{ m }}</div>{% endfor %}{% block c %}{% endblock %}</main>
 {% if not bare and me %}<nav class="tabs"><div>{% for h,i,l in [('/','home','Découverte'),('/communautes','users','Groupes'),('/quiz','game','Quiz'),('/catalogue','compass','Catalogue'),('/profil/'+me.username if me else '/connexion','user','Profil')] %}
 <a href="{{ h }}" class="{{ 'on' if (path==h or (h!='/' and path.startswith(h[:6]))) }} {{ 'mid' if i=='game' }}">{{ ic(i) }}{{ l }}{% if i=='users' and gunread %}<b class="nb">{{ gunread if gunread<100 else '99+' }}</b>{% endif %}</a>{% endfor %}</div></nav>{% endif %}{% if me %}<script>setInterval(function(){if(document.hidden)return;fetch('/api/groupes/non-lus',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){var a=document.querySelector('.tabs a[href="/communautes"]');if(!a)return;var b=a.querySelector('.nb');if(d.n>0){if(!b){b=document.createElement('b');b.className='nb';a.appendChild(b)}b.textContent=d.n>99?'99+':d.n}else if(b)b.remove()}).catch(function(){})},40000)</script>{% endif %}<script>if('serviceWorker' in navigator)addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){})});var DP;addEventListener('beforeinstallprompt',function(e){e.preventDefault();DP=e});
 function installApp(){if(DP){DP.prompt();DP=null}else alert("Menu ⋮ du navigateur → « Installer l'application » ou « Ajouter à l'écran d'accueil ».")}</script><script>var CSRF="{{ session.get('csrf','') }}";
+function sxLogout(e){e.preventDefault();var f=e.target,b=f.querySelector('button');if(b)b.disabled=true;sxToast('D\u00e9connexion\u2026');var gone=false;
+ function go(){if(gone)return;gone=true;location.replace('/')}
+ var clean=[];try{if(window.caches)clean.push(caches.keys().then(function(k){return Promise.all(k.map(function(x){return caches.delete(x)}))}))}catch(x){}
+ try{if(navigator.serviceWorker)clean.push(navigator.serviceWorker.getRegistrations().then(function(r){return Promise.all(r.map(function(x){return x.unregister()}))}))}catch(x){}
+ var t=setTimeout(go,4000);
+ fetch('/deconnexion',{method:'POST',credentials:'same-origin',headers:{'X-CSRF':CSRF},redirect:'manual',cache:'no-store'}).catch(function(){}).then(function(){return Promise.all(clean.map(function(p){return p.catch(function(){})}))}).then(function(){clearTimeout(t);go()});
+ setTimeout(function(){if(!gone){try{f.submit()}catch(x){go()}}},6000);return false}
 function sxMenu(o){var d=document.getElementById('sxdrw'),v=document.getElementById('sxov');if(!d)return;if(o)v.hidden=false;setTimeout(function(){d.classList.toggle('open',o);v.classList.toggle('open',o)},o?10:0);d.setAttribute('aria-hidden',o?'false':'true');document.body.style.overflow=o?'hidden':'';if(!o)setTimeout(function(){if(!d.classList.contains('open'))v.hidden=true},280)}
 (function(){var d=document.getElementById('sxdrw');if(!d)return;var x0=0;d.addEventListener('touchstart',function(e){x0=e.touches[0].clientX},{passive:true});d.addEventListener('touchend',function(e){if(e.changedTouches[0].clientX-x0>70)sxMenu(false)},{passive:true});addEventListener('keydown',function(e){if(e.key==='Escape')sxMenu(false)});if(window.SX_APP)document.querySelectorAll('.js-install').forEach(function(a){a.style.display='none'})})();
 var sxT;function sxToast(m,bad){var t=document.getElementById('sxtoast');if(!t){t=document.createElement('div');t.id='sxtoast';document.body.appendChild(t)}t.textContent=m;t.className='sxt show'+(bad?' bad':'');clearTimeout(sxT);sxT=setTimeout(function(){t.className='sxt'},1800)}
@@ -3235,14 +3268,17 @@ T["notifs.html"] = r"""{% extends "base.html" %}{% block c %}<div class="row"><h
 T["settings.html"] = r"""{% extends "base.html" %}{% from "m.html" import navlist, pref with context %}{% block c %}<h1>Paramètres</h1>
 <div class="card row">{{ ava(me.username,56) }}<div class="grow"><b style="font-size:1.1rem">{{ me.username }}</b><small class="mut" style="display:block">Membre depuis {{ me.created[:10] }}</small></div><a class="btn s g" href="/profil/{{ me.username }}">Voir</a></div>
 <div class="sec">Préférences <span style="text-transform:none;letter-spacing:0;font-weight:500">· enregistrées automatiquement</span></div><div class="grp">{{ pref('theme', me.theme=='light', 'Thème clair', 'Désactivé = thème sombre', 'compass') }}{{ pref('notify', me.notify, 'Notifications', "J'aime, commentaires", 'bell') }}{{ pref('privacy', me.privacy=='private', 'Profil privé', 'Seul toi vois ton profil', 'lock') }}{{ pref('dm', me.dm=='all', 'Messages privés', 'Autoriser les messages', 'msg') }}</div>
-<form method="post">{{ csrf() }}<input type="hidden" name="action" value="profile"><div class="sec">Profil</div><div class="grp" style="padding:12px 16px"><label style="margin-top:0">Biographie</label><textarea name="bio" maxlength="300">{{ me.bio }}</textarea><label>E-mail (pour te connecter et récupérer ton compte)</label><input type="email" name="email" maxlength="120" value="{{ me.email or '' }}" placeholder="facultatif"><p><button class="btn s">Enregistrer le profil</button></p></div></form>
+<div class="sec">Profil</div><div class="grp"><details class="acc"><summary class="it"><span class="ico">{{ ic('edit',19) }}</span><span class="grow">Modifier ma bio et mon e-mail<small>Pour te connecter et récupérer ton compte</small></span>{{ ic('chev',18) }}</summary>
+<form method="post" class="accb">{{ csrf() }}<input type="hidden" name="action" value="profile"><label>Biographie</label><textarea name="bio" maxlength="300">{{ me.bio }}</textarea><label>E-mail</label><input type="email" name="email" maxlength="120" value="{{ me.email or '' }}" placeholder="facultatif"><p><button class="btn s">Enregistrer</button></p></form></details></div>
 {{ navlist(nav('settings')) }}
-<div class="sec">Sécurité</div><div class="grp" style="padding:12px 16px"><form method="post">{{ csrf() }}<input type="hidden" name="action" value="password"><label style="margin-top:0">Mot de passe actuel</label><input type="password" name="old" autocomplete="current-password"><label>Nouveau (8+)</label><input type="password" name="new" autocomplete="new-password"><p><button class="btn s">Changer</button></p></form>
-<form method="post">{{ csrf() }}<input type="hidden" name="action" value="regen"><label>Code de récupération {{ '(défini)' if me.recovery else '(aucun)' }}</label><input type="password" name="password" placeholder="Ton mot de passe pour générer un nouveau code" autocomplete="current-password"><p><button class="btn s g">Générer un nouveau code</button></p></form>
-<form method="post">{{ csrf() }}<input type="hidden" name="action" value="logout_all"><button class="btn s g">Déconnecter les autres appareils</button></form></div>
+<div class="sec">Sécurité</div><div class="grp">
+<details class="acc"><summary class="it"><span class="ico">{{ ic('lock',19) }}</span><span class="grow">Changer le mot de passe</span>{{ ic('chev',18) }}</summary><form method="post" class="accb">{{ csrf() }}<input type="hidden" name="action" value="password"><label>Mot de passe actuel</label><input type="password" name="old" autocomplete="current-password"><label>Nouveau (8+)</label><input type="password" name="new" autocomplete="new-password"><p><button class="btn s">Changer</button></p></form></details>
+<details class="acc"><summary class="it"><span class="ico">{{ ic('shield',19) }}</span><span class="grow">Code de récupération<small>{{ 'Défini' if me.recovery else 'Aucun' }}</small></span>{{ ic('chev',18) }}</summary><form method="post" class="accb">{{ csrf() }}<input type="hidden" name="action" value="regen"><label>Ton mot de passe</label><input type="password" name="password" placeholder="Pour générer un nouveau code" autocomplete="current-password"><p><button class="btn s g">Générer un nouveau code</button></p></form></details>
+<form method="post">{{ csrf() }}<input type="hidden" name="action" value="logout_all"><button class="it"><span class="ico">{{ ic('users',19) }}</span><span class="grow">Déconnecter les autres appareils</span></button></form></div>
 <div class="sec">Mes données</div><div class="grp"><form method="post" action="/export">{{ csrf() }}<button class="it"><span class="ico">{{ ic('dl',19) }}</span><span class="grow">Exporter mes données (JSON)</span></button></form></div>
-<div class="grp"><form method="post" action="/deconnexion" onsubmit="try{caches.keys().then(function(k){k.forEach(function(x){caches.delete(x)})})}catch(e){}">{{ csrf() }}<button class="it"><span class="ico">{{ ic('out',19) }}</span><span class="grow">Se déconnecter</span></button></form></div>
-<div class="sec" style="color:#ff6b81">Zone dangereuse</div><div class="grp" style="padding:12px 16px"><form method="post" onsubmit="return confirm('Supprimer définitivement ?')">{{ csrf() }}<input type="hidden" name="action" value="delete"><small class="mut">Irréversible. Tape ton pseudo et ton mot de passe.</small><input name="confirm" placeholder="Ton pseudo" style="margin:8px 0"><input type="password" name="password" placeholder="Mot de passe"><p><button class="btn s r">Supprimer mon compte</button></p></form></div>
+<div class="grp"><form method="post" action="/deconnexion" onsubmit="return sxLogout(event)">{{ csrf() }}<button class="it"><span class="ico">{{ ic('out',19) }}</span><span class="grow">Se déconnecter</span></button></form></div>
+<div class="sec" style="color:#ff6b81">Zone dangereuse</div><div class="grp"><details class="acc"><summary class="it"><span class="ico" style="color:#ff6b81">{{ ic('trash',19) }}</span><span class="grow" style="color:#ff6b81">Supprimer mon compte</span>{{ ic('chev',18) }}</summary>
+<form method="post" class="accb" onsubmit="return confirm('Supprimer définitivement ?')">{{ csrf() }}<input type="hidden" name="action" value="delete"><small class="mut">Irréversible. Tape ton pseudo et ton mot de passe.</small><input name="confirm" placeholder="Ton pseudo" style="margin:8px 0" autocomplete="off"><input type="password" name="password" placeholder="Mot de passe"><p><button class="btn s r">Supprimer mon compte</button></p></form></details></div>
 <p class="mut" style="text-align:center;font-size:.72rem">SenpaiX v5 · Jikan + AniList</p>{% endblock %}"""
 
 T["auth.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><div class="logo" style="font-size:2.6rem">Senpai<b>X</b></div><p class="mut" style="margin:4px 0 14px">L'univers Otaku autrement.</p>
