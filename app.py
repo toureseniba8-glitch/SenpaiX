@@ -119,6 +119,9 @@ CREATE TABLE IF NOT EXISTS admin_log(id INTEGER PRIMARY KEY,admin_id INTEGER REF
 CREATE TABLE IF NOT EXISTS images(user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,kind TEXT,data BLOB,PRIMARY KEY(user_id,kind));
 CREATE TABLE IF NOT EXISTS notifs(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
  text TEXT,link TEXT DEFAULT '/',read INTEGER DEFAULT 0,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS daily(user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,day TEXT NOT NULL,xp INTEGER DEFAULT 0,PRIMARY KEY(user_id,day));
+CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY,v TEXT);
+CREATE TABLE IF NOT EXISTS push(endpoint TEXT PRIMARY KEY,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,p256dh TEXT NOT NULL,auth TEXT NOT NULL,created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS msgs(id INTEGER PRIMARY KEY,s INTEGER REFERENCES users(id) ON DELETE CASCADE,
  r INTEGER REFERENCES users(id) ON DELETE CASCADE,body TEXT NOT NULL,read INTEGER DEFAULT 0,created TEXT NOT NULL);
 """
@@ -381,7 +384,7 @@ def toint(v, d=0, lo=0, hi=100000):
 # les pages légales et les aperçus des liens partagés (défi, carte). Pour désactiver : variable d'environnement LOGIN_WALL=0.
 WALL = os.environ.get("LOGIN_WALL", "1") != "0"
 PUBLIC_ENDPOINTS = {"index", "login", "register", "forgot", "logout", "setup", "healthz", "robots", "icon_png", "manifest", "sw", "privacy_page", "terms_page", "about",
-                    "api_pseudo", "diagnostic", "duel_page", "card_page", "static", "install_page"}
+                    "api_pseudo", "cron_rappels", "push_sw", "diagnostic", "duel_page", "card_page", "static", "install_page"}
 
 
 @app.before_request
@@ -621,7 +624,7 @@ def index():
     posts = db().execute(POSTQ + "WHERE " + " AND ".join(conds) + " ORDER BY p.id DESC LIMIT 40", args).fetchall()
     watch = [r[0] for r in db().execute("SELECT mal_id FROM favs WHERE user_id=? AND status IN('cours','voir') AND kind='anime' ORDER BY updated DESC LIMIT 50", (uid(),))] if me() else []
     trailers = db().execute("SELECT * FROM trailers ORDER BY pos DESC,id DESC LIMIT 8").fetchall()
-    return render_template("home.html", title="Découverte", tab=tab, posts=posts, eta=next_tournament(), watch=watch, trailers=trailers, events=evt_live(db(), 6), dlcount=db().execute("SELECT COUNT(*) FROM downloads WHERE hidden=0").fetchone()[0], rk=(user_xp(db(), me()) if me() else None))
+    return render_template("home.html", title="Découverte", tab=tab, posts=posts, eta=next_tournament(), watch=watch, trailers=trailers, events=evt_live(db(), 6), dlcount=db().execute("SELECT COUNT(*) FROM downloads WHERE hidden=0").fetchone()[0], rk=(user_xp(db(), me()) if me() else None), sk=(streak_info(db(), me()["id"]) if me() else None), dc=daily_challenge(db()), rit=ritual_of_day(), ms=(missions(db(), me()) if me() else None), wk=(week_board(db(), 0, 3) if me() else []))
 
 
 YT_RE = re.compile(r"(?:youtu\.be/|youtube(?:-nocookie)?\.com/(?:watch\?(?:[^#]*&)?v=|embed/|shorts/|live/|v/))([\w-]{11})(?![\w-])")
@@ -1176,6 +1179,11 @@ def auto_purge():
         return
     PURGE["t"] = time.time()
     try:
+        send_reminders(db())
+    except Exception:
+        log.exception("rappels (visite)")
+        safe_rollback()
+    try:
         n = purge_media(db())
         if n:
             log.info("Nettoyage des médias : %s fichier(s) supprimé(s)", n)
@@ -1258,6 +1266,7 @@ def new_cpost(d, c, body, mk="", rid=0, serie=None):
     pid = d.execute("INSERT INTO cposts(cid,user_id,body,created,mk,rid,mal_id,m_title,m_img) VALUES(?,?,?,?,?,?,?,?,?)",
                     (c["id"], uid(), body, now(), mk, rid, serie[0] if serie else 0, serie[1] if serie else "", serie[2] if serie else "")).lastrowid
     link, told, who = f"/communaute/{c['id']}#m{pid}", set(), me()["username"]
+    ritual_reward(d, body)
     if rid:
         q = d.execute("SELECT user_id FROM cposts WHERE id=?", (rid,)).fetchone()
         if q and q["user_id"] != uid():
@@ -1347,7 +1356,8 @@ def community(cid):
         muted = bool((d.execute("SELECT mute FROM gseen WHERE cid=? AND user_id=?", (cid, uid())).fetchone() or {"mute": 0})["mute"])
     return render_template("community.html", title=c["name"], c=c, joined=joined, posts=posts, more=more, rc=rc, rm=rm, mem=mem, nmem=nmem,
                            can_edit=can_edit_group(c), mod=can_edit_group(c), pinid=c["pin"], pin=pin, names=names, muted=muted,
-                           last=posts[-1]["id"] if posts else 0, first=posts[0]["id"] if posts else 0)
+                           last=posts[-1]["id"] if posts else 0, first=posts[0]["id"] if posts else 0,
+                           rit=ritual_of_day(), rit_n=d_rit_count(c["id"]), rit_done=bool(me() and db().execute("SELECT 1 FROM daily WHERE user_id=? AND day=?", (uid(), "rit-" + str(datetime.now(timezone.utc).date()))).fetchone()))
 
 
 @app.route("/communaute/<int:cid>/membres")
@@ -1570,8 +1580,379 @@ def api_finish():
 
 # ───────────────────────────── Rangs d'otaku, défis quiz, carte à partager ─────────────────────────────
 RANKS = [(0, "🌱", "Novice"), (100, "🥷", "Genin"), (300, "⚔️", "Chūnin"), (700, "🔥", "Jōnin"), (1500, "⚡", "Sannin"), (3000, "👑", "Kage"), (6000, "🌟", "Légende")]
-XP_RULES = [("Jouer un quiz", "+10"), ("Chaque bonne réponse au quiz", "+3"), ("Relever un défi", "+10"), ("Gagner un défi", "+25"), ("Publier un post", "+15"), ("Commenter", "+5"),
-            ("Recevoir un like", "+3"), ("Rejoindre un groupe", "+10"), ("Ajouter une série en favori", "+2")]
+XP_RULES = [("🎖️ Missions de bienvenue (7 jours pour tout finir)", "+5 à +50"), ("🏅 Podium de la semaine (n°1 / 2 / 3)", "+100 / 60 / 30"), ("🎯 Répondre au rituel du jour dans un groupe", "+10"), ("🏆 Podium du tournoi (n°1 / 2 / 3)", "+30 / 20 / 10"), ("Jouer un quiz", "+10"), ("Chaque bonne réponse au quiz", "+3"), ("Relever un défi", "+10"), ("Gagner un défi", "+25"), ("Publier un post", "+15"), ("Commenter", "+5"),
+            ("Recevoir un like", "+3"), ("Rejoindre un groupe", "+10"), ("Ajouter une série en favori", "+2"),
+            ("🔥 Bonus quotidien (monte chaque jour de suite)", "+10 à +55"), ("Paliers de série : 3, 7, 14, 30 jours", "+20 à +250")]
+
+
+STREAK_MILESTONES = {3: 20, 7: 50, 14: 100, 30: 250}
+
+
+def streak_bonus(n):
+    """XP gagnés en validant le n-ième jour d'affilée : monte chaque jour (plafonné) + gros cadeau aux paliers."""
+    return 10 + 5 * min(n - 1, 9) + STREAK_MILESTONES.get(n, 0)
+
+
+def streak_info(d, uid_):
+    today = datetime.now(timezone.utc).date()
+    days = {r[0] for r in d.execute("SELECT day FROM daily WHERE user_id=? AND day>=?", (uid_, str(today - timedelta(days=400))))}
+    done = str(today) in days
+    cur = today if done else today - timedelta(days=1)
+    n = 0
+    while str(cur) in days:
+        n += 1
+        cur -= timedelta(days=1)
+    after = n + (0 if done else 1)
+    nxt_m = next((m for m in sorted(STREAK_MILESTONES) if m > n), None)
+    week = [dict(d="LMMJVSD"[(today - timedelta(days=k)).weekday()], ok=str(today - timedelta(days=k)) in days) for k in range(6, -1, -1)]
+    return dict(n=n, done=done, bonus=streak_bonus(after if not done else n + 1), after=after, week=week, ms=nxt_m, ms_xp=STREAK_MILESTONES.get(nxt_m, 0), ms_in=(nxt_m - n - (0 if done else 1)) if nxt_m else 0)
+
+
+@app.route("/bonus-du-jour", methods=["POST"])
+@login_required
+def daily_claim():
+    d = db()
+    info = streak_info(d, me()["id"])
+    if info["done"]:
+        flash("Tu as déjà récupéré ton bonus aujourd'hui. Reviens demain ! 🔥", "ok")
+        return redirect(request.referrer or "/")
+    n = info["after"]
+    xp = streak_bonus(n)
+    d.execute("INSERT INTO daily(user_id,day,xp) VALUES(?,?,?) ON CONFLICT DO NOTHING", (me()["id"], str(datetime.now(timezone.utc).date()), xp))
+    extra = " 🎁 Palier atteint !" if n in STREAK_MILESTONES else ""
+    flash(f"🔥 Jour {n} d'affilée : +{xp} XP !{extra}", "ok")
+    return redirect(request.referrer or "/")
+
+
+RITUALS = [
+    "Quel anime t'a fait pleurer ? Raconte en une phrase.", "Ton top 3 des meilleurs openings ?", "Le perso que tu aurais aimé être pour un jour ?",
+    "Quel anime tout le monde devrait voir au moins une fois ?", "Ton combat préféré de tous les temps ?", "Un anime sous-estimé que personne ne regarde ?",
+    "Le meilleur méchant d'anime selon toi ?", "Ton premier anime, celui qui a tout commencé ?", "Anime ou manga : tu choisis quoi, et pourquoi ?",
+    "La fin d'anime qui t'a le plus déçu ?", "Ton duo de personnages préféré ?", "L'anime que tu regardes en ce moment ?",
+    "Le plus beau moment d'anime que tu aies vu ?", "Un anime à regarder quand on a le moral à zéro ?", "Ton personnage secondaire préféré ?",
+    "Quel pouvoir d'anime voudrais-tu avoir ?", "Le meilleur anime de combat ? Argumente en 1 phrase.", "Ton ending (générique de fin) préféré ?",
+    "Un anime que tu as abandonné et pourquoi ?", "Le meilleur twist d'anime que tu aies vu venir (ou pas) ?", "Quel anime a la meilleure bande-son ?",
+    "Ton waifu / husbando du moment ?", "Une réplique d'anime qui t'est restée en tête ?", "Le meilleur anime de tous les temps ? Un seul choix !",
+    "Un anime que tu recommandes à un débutant ?", "Ton arc préféré dans une série ?", "Quel anime t'a donné envie de t'entraîner ou de te dépasser ?",
+    "L'anime le plus drôle que tu connaisses ?", "Le meilleur anime du moment ? Donne ton avis.", "Ton film d'anime préféré ?", "Quel anime a la meilleure animation ?",
+]
+
+
+def ritual_of_day():
+    return RITUALS[datetime.now(timezone.utc).date().toordinal() % len(RITUALS)]
+
+
+def d_rit_count(cid):
+    return db().execute("SELECT COUNT(DISTINCT user_id) FROM cposts WHERE cid=? AND created>=? AND body LIKE ?", (cid, now()[:10], "🎯 " + ritual_of_day() + "%")).fetchone()[0]
+
+
+def ritual_reward(d, body):
+    """+10 XP (une fois par jour) quand on répond au rituel du jour dans un groupe : le message commence par « 🎯 <question> » et contient une vraie réponse."""
+    pre = "🎯 " + ritual_of_day()
+    if me() and body.startswith(pre) and len(body.strip()) >= len(pre) + 3:
+        day = "rit-" + str(datetime.now(timezone.utc).date())
+        if not d.execute("SELECT 1 FROM daily WHERE user_id=? AND day=?", (uid(), day)).fetchone():
+            d.execute("INSERT INTO daily(user_id,day,xp) VALUES(?,?,10) ON CONFLICT DO NOTHING", (uid(), day))
+            return True
+    return False
+
+
+def award_podium(d):
+    """Podium d'hier : +30 / +20 / +10 XP aux 3 premiers du tournoi (une seule fois, notification à chacun)."""
+    y = str(datetime.now(timezone.utc).date() - timedelta(days=1))
+    rows = d.execute("SELECT s.user_id,MAX(s.good) g,MIN(s.ms) ms FROM scores s WHERE s.day=? AND s.mode='tournoi' GROUP BY s.user_id ORDER BY g DESC,ms ASC LIMIT 3", (y,)).fetchall()
+    for k, r in enumerate(rows):
+        key = "pod-" + y
+        if not d.execute("SELECT 1 FROM daily WHERE user_id=? AND day=?", (r["user_id"], key)).fetchone():
+            xp = (30, 20, 10)[k]
+            d.execute("INSERT INTO daily(user_id,day,xp) VALUES(?,?,?) ON CONFLICT DO NOTHING", (r["user_id"], key, xp))
+            notify(r["user_id"], f"{('🥇', '🥈', '🥉')[k]} Tu as fini n°{k + 1} du tournoi d'hier : +{xp} XP !", "/quiz")
+
+
+def daily_challenge(d):
+    day = now()[:10]
+    if me():
+        award_podium(d)
+    board = d.execute("SELECT u.username,MAX(s.good) g,MIN(s.ms) ms FROM scores s JOIN users u ON u.id=s.user_id WHERE s.day=? AND s.mode='tournoi' GROUP BY u.id ORDER BY g DESC,ms ASC", (day,)).fetchall()
+    mine = next((dict(rank=i + 1, g=r["g"]) for i, r in enumerate(board) if me() and r["username"] == me()["username"]), None)
+    y = str(datetime.now(timezone.utc).date() - timedelta(days=1))
+    champ = d.execute("SELECT u.username,MAX(s.good) g FROM scores s JOIN users u ON u.id=s.user_id WHERE s.day=? AND s.mode='tournoi' GROUP BY u.id ORDER BY g DESC,MIN(s.ms) ASC LIMIT 1", (y,)).fetchone()
+    return dict(top=[dict(u=r["username"], g=r["g"]) for r in board[:3]], n=len(board), mine=mine, champ=dict(u=champ["username"], g=champ["g"]) if champ else None)
+
+
+# ───────────────────────────── Rappels : notifications push + « ta série va se perdre » ─────────────────────────────
+REMIND_HOUR_UTC = 18     # à partir de cette heure (UTC), on prévient ceux qui n'ont pas encore récupéré leur bonus du jour
+
+
+def _b64u(b):
+    import base64
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def _unb64u(t):
+    import base64
+    return base64.urlsafe_b64decode(t + "=" * (-len(t) % 4))
+
+
+CRY = {"ok": False, "busy": False}
+
+
+def _crypto_install():
+    try:
+        import subprocess, sys, importlib
+        target = os.path.join(BASE, ".pylibs")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--target", target, "cryptography"], timeout=240)
+        if target not in sys.path:
+            sys.path.insert(0, target)
+        importlib.invalidate_caches()
+        import cryptography  # noqa
+        CRY["ok"] = True
+        log.info("« cryptography » installée : notifications push actives")
+    except Exception:
+        log.exception("Impossible d'installer « cryptography » (ajoute-la dans requirements.txt) : notifications push désactivées")
+
+
+def _crypto():
+    """True si « cryptography » est dispo. Sinon l'installation se fait en arrière-plan (jamais pendant une requête) et on renvoie False en attendant."""
+    if CRY["ok"]:
+        return True
+    try:
+        import cryptography  # noqa
+        CRY["ok"] = True
+        return True
+    except ImportError:
+        if not CRY["busy"]:
+            CRY["busy"] = True
+            threading.Thread(target=_crypto_install, daemon=True).start()
+        return False
+
+
+def vapid_keys(d):
+    """Clés VAPID (créées une fois, gardées en base) -> (clé privée EC, clé publique non compressée en base64url)."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization as ser
+    row = d.execute("SELECT v FROM kv WHERE k='vapid'").fetchone()
+    if row:
+        priv = ser.load_der_private_key(_unb64u(row[0]), None)
+    else:
+        priv = ec.generate_private_key(ec.SECP256R1())
+        d.execute("INSERT INTO kv(k,v) VALUES('vapid',?) ON CONFLICT DO NOTHING", (_b64u(priv.private_bytes(ser.Encoding.DER, ser.PrivateFormat.PKCS8, ser.NoEncryption())),))
+        d.commit()
+    pub = priv.public_key().public_bytes(ser.Encoding.X962, ser.PublicFormat.UncompressedPoint)
+    return priv, _b64u(pub)
+
+
+def webpush_encrypt(payload, p256dh, auth, salt=None, eph=None):
+    """Chiffrement du message (RFC 8291, aes128gcm) -> corps à envoyer au service de push."""
+    import struct
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import hashes, serialization as ser
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    ua_pub = _unb64u(p256dh)
+    eph = eph or ec.generate_private_key(ec.SECP256R1())
+    as_pub = eph.public_key().public_bytes(ser.Encoding.X962, ser.PublicFormat.UncompressedPoint)
+    shared = eph.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ua_pub))
+    salt = salt or os.urandom(16)
+    ikm = HKDF(hashes.SHA256(), 32, _unb64u(auth), b"WebPush: info\x00" + ua_pub + as_pub).derive(shared)
+    cek = HKDF(hashes.SHA256(), 16, salt, b"Content-Encoding: aes128gcm\x00").derive(ikm)
+    nonce = HKDF(hashes.SHA256(), 12, salt, b"Content-Encoding: nonce\x00").derive(ikm)
+    return salt + struct.pack(">IB", 4096, len(as_pub)) + as_pub + AESGCM(cek).encrypt(nonce, payload + b"\x02", None)
+
+
+def vapid_header(priv, pub, endpoint):
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    from cryptography.hazmat.primitives import hashes
+    u = urllib.parse.urlparse(endpoint)
+    head = _b64u(json.dumps({"typ": "JWT", "alg": "ES256"}).encode())
+    body = _b64u(json.dumps({"aud": f"{u.scheme}://{u.netloc}", "exp": int(time.time()) + 12 * 3600, "sub": "mailto:" + EMAIL}).encode())
+    r, sg = decode_dss_signature(priv.sign(f"{head}.{body}".encode(), ec.ECDSA(hashes.SHA256())))
+    return f"vapid t={head}.{body}.{_b64u(r.to_bytes(32, 'big') + sg.to_bytes(32, 'big'))}, k={pub}"
+
+
+def send_push(d, uid_, title, body, url="/"):
+    """Envoie une notification à tous les appareils d'un membre. Les appareils qui ont désinscrit sont supprimés. -> nombre d'envois réussis."""
+    subs = d.execute("SELECT * FROM push WHERE user_id=?", (uid_,)).fetchall()
+    if not subs or not _crypto():
+        return 0
+    priv, pub = vapid_keys(d)
+    ok = 0
+    data = json.dumps({"title": title, "body": body, "url": url}).encode()
+    for sb in subs:
+        try:
+            req = urllib.request.Request(sb["endpoint"], data=webpush_encrypt(data, sb["p256dh"], sb["auth"]), method="POST",
+                                         headers={"Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream", "TTL": "43200", "Urgency": "normal",
+                                                  "Authorization": vapid_header(priv, pub, sb["endpoint"])})
+            urllib.request.urlopen(req, timeout=8).close()
+            ok += 1
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):
+                d.execute("DELETE FROM push WHERE endpoint=?", (sb["endpoint"],))
+            else:
+                log.warning("push refusé (%s)", e.code)
+        except Exception:
+            log.warning("push : envoi impossible")
+    return ok
+
+
+def send_reminders(d):
+    """Prévient (cloche + notification push) ceux dont la série est en danger. Une seule fois par membre et par jour, à partir de REMIND_HOUR_UTC."""
+    n_ = datetime.now(timezone.utc)
+    if n_.hour < REMIND_HOUR_UTC:
+        return 0
+    today, yest = str(n_.date()), str(n_.date() - timedelta(days=1))
+    rows = d.execute("SELECT y.user_id FROM daily y JOIN users u ON u.id=y.user_id WHERE y.day=? AND u.notify=1 "
+                     "AND y.user_id NOT IN (SELECT user_id FROM daily WHERE day=? OR day=?)", (yest, today, "rem-" + today)).fetchall()
+    sent = 0
+    for r in rows:
+        i = r["user_id"]
+        d.execute("INSERT INTO daily(user_id,day,xp) VALUES(?,?,0) ON CONFLICT DO NOTHING", (i, "rem-" + today))
+        info = streak_info(d, i)
+        if info["done"] or info["n"] < 1:
+            continue
+        txt_ = f"Ta série de {info['n']} jour{'s' if info['n'] > 1 else ''} va se perdre à minuit ! Récupère ton bonus : +{info['bonus']} XP"
+        d.execute("INSERT INTO notifs(user_id,text,link,created) VALUES(?,?,?,?)", (i, "🔥 " + txt_, "/", now()))
+        send_push(d, i, "🔥 Ta série va se perdre !", txt_, "/")
+        sent += 1
+    d.commit()
+    return sent
+
+
+@app.route("/tache/rappels")
+def cron_rappels():
+    """À appeler toutes les 30 min par un service gratuit (cron-job.org, UptimeRobot…). Sans danger : chaque membre n'est prévenu qu'une fois par jour."""
+    try:
+        return jsonify(ok=True, rappels=send_reminders(db()), heure_utc=datetime.now(timezone.utc).hour)
+    except Exception:
+        log.exception("rappels")
+        safe_rollback()
+        return jsonify(ok=False), 500
+
+
+@app.route("/api/push/cle")
+def api_push_key():
+    if not me() or not _crypto():
+        return jsonify(error="indisponible"), 503
+    return jsonify(key=vapid_keys(db())[1])
+
+
+@app.route("/api/push/abonner", methods=["POST"])
+def api_push_sub():
+    if not me():
+        return jsonify(error="Connecte-toi d'abord."), 401
+    j = request.get_json(silent=True) or {}
+    k = j.get("keys") or {}
+    ep, a, b = txt(j.get("endpoint"), 600), txt(k.get("p256dh"), 200), txt(k.get("auth"), 100)
+    if not ep.startswith("https://") or not a or not b:
+        return jsonify(error="Abonnement invalide."), 400
+    d = db()
+    d.execute("DELETE FROM push WHERE endpoint=?", (ep,))
+    d.execute("INSERT INTO push(endpoint,user_id,p256dh,auth,created) VALUES(?,?,?,?,?)", (ep, uid(), a, b, now()))
+    return jsonify(ok=True)
+
+
+PUSH_SW = r"""self.addEventListener('install',e=>self.skipWaiting());
+self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));
+self.addEventListener('push',e=>{let d={};try{d=e.data.json()}catch(x){}
+ e.waitUntil(self.registration.showNotification(d.title||'SenpaiX',{body:d.body||'',icon:'/icon-192.png',badge:'/icon-192.png',tag:'sx-rappel',renotify:true,data:{url:d.url||'/'}}))});
+self.addEventListener('notificationclick',e=>{e.notification.close();const u=(e.notification.data&&e.notification.data.url)||'/';
+ e.waitUntil(self.clients.matchAll({type:'window',includeUncontrolled:true}).then(l=>{for(const c of l){if('focus' in c){c.navigate(u);return c.focus()}}return self.clients.openWindow(u)}))});
+"""
+
+
+@app.route("/push-sw.js")
+def push_sw():
+    return app.response_class(PUSH_SW, mimetype="application/javascript", headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"})
+
+
+# ───────────────────────────── Missions de bienvenue + classement de la semaine ─────────────────────────────
+MISSIONS = [  # (clé, titre, XP, lien, requête qui renvoie le nombre déjà fait)
+    ("grp", "Rejoindre un groupe", 10, "/communautes", "SELECT COUNT(*) FROM members WHERE user_id=?"),
+    ("fav", "Ajouter 3 séries en favori", 10, "/catalogue", "SELECT CASE WHEN COUNT(*)>=3 THEN 1 ELSE 0 END FROM favs WHERE user_id=?"),
+    ("quiz", "Jouer un quiz", 10, "/quiz", "SELECT COUNT(*) FROM scores WHERE user_id=?"),
+    ("bonus", "Récupérer ton premier bonus du jour", 5, "/", "SELECT COUNT(*) FROM daily WHERE user_id=? AND day LIKE '____-__-__'"),
+    ("msg", "Écrire un message dans un groupe", 15, "/communautes", "SELECT COUNT(*) FROM cposts WHERE user_id=?"),
+    ("react", "Aimer un post ou réagir à un message", 5, "/", "SELECT (SELECT COUNT(*) FROM likes WHERE user_id=?)+(SELECT COUNT(*) FROM creacts WHERE user_id=?)"),
+    ("post", "Publier ton premier post", 15, "/", "SELECT COUNT(*) FROM posts WHERE user_id=?"),
+]
+MISSION_ALL_XP = 50
+MISSION_DAYS = 14
+
+
+def missions(d, u):
+    """Missions de bienvenue : liste (avec état), XP attribués automatiquement dès qu'une mission est faite. None si le membre n'est plus concerné."""
+    try:
+        age = (datetime.now(timezone.utc) - datetime.strptime(u["created"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)).days
+    except Exception:
+        age = 0
+    have = {r[0] for r in d.execute("SELECT day FROM daily WHERE user_id=? AND day LIKE 'mis-%'", (u["id"],))}
+    if "mis-all" in have or age > MISSION_DAYS:
+        return None
+    out = []
+    for key, title, xp, link, q in MISSIONS:
+        n = d.execute(q, (u["id"],) * q.count("?")).fetchone()[0]
+        ok = n > 0
+        if ok and "mis-" + key not in have:
+            d.execute("INSERT INTO daily(user_id,day,xp) VALUES(?,?,?) ON CONFLICT DO NOTHING", (u["id"], "mis-" + key, xp))
+            have.add("mis-" + key)
+        out.append(dict(key=key, title=title, xp=xp, link=link, ok=ok))
+    if all(m["ok"] for m in out):
+        d.execute("INSERT INTO daily(user_id,day,xp) VALUES(?,?,?) ON CONFLICT DO NOTHING", (u["id"], "mis-all", MISSION_ALL_XP))
+        d.execute("INSERT INTO notifs(user_id,text,link,created) VALUES(?,?,?,?)", (u["id"], f"🎖️ Missions terminées ! Badge « Recrue » + {MISSION_ALL_XP} XP", f"/profil/{u['username']}", now()))
+        return None
+    return dict(items=out, done=sum(m["ok"] for m in out), total=len(out), left=max(0, MISSION_DAYS - age))
+
+
+def week_start(offset=0):
+    t = datetime.now(timezone.utc).date()
+    return t - timedelta(days=t.weekday()) + timedelta(weeks=offset)
+
+
+def week_board(d, offset=0, limit=20):
+    """Points de la semaine (lundi → dimanche, UTC) : quiz, posts, commentaires, messages de groupe (plafonnés), bonus et rituels. -> [(id, pseudo, points)]"""
+    a = week_start(offset)
+    lo, hi = str(a), str(a + timedelta(days=7))
+    pts = {}
+
+    def add(sql, args, f):
+        for r in d.execute(sql, args):
+            pts[r[0]] = pts.get(r[0], 0) + f(r[1])
+    add("SELECT user_id,SUM(10+good*3) FROM scores WHERE created>=? AND created<? GROUP BY user_id", (lo, hi), int)
+    add("SELECT user_id,COUNT(*) FROM posts WHERE created>=? AND created<? GROUP BY user_id", (lo, hi), lambda n: n * 15)
+    add("SELECT user_id,COUNT(*) FROM comments WHERE created>=? AND created<? GROUP BY user_id", (lo, hi), lambda n: min(n, 20) * 5)
+    add("SELECT user_id,COUNT(*) FROM cposts WHERE created>=? AND created<? GROUP BY user_id", (lo, hi), lambda n: min(n, 30) * 2)
+    for r in d.execute("SELECT user_id,day,xp FROM daily WHERE day NOT LIKE 'mis-%' AND day NOT LIKE 'wk-%' AND day NOT LIKE 'rem-%'"):
+        if lo <= r["day"][-10:] < hi:
+            pts[r["user_id"]] = pts.get(r["user_id"], 0) + r["xp"]
+    if not pts:
+        return []
+    ph = ",".join("?" * len(pts))
+    names = {r["id"]: r["username"] for r in d.execute(f"SELECT id,username FROM users WHERE banned=0 AND privacy<>'private' AND id IN ({ph})", tuple(pts))}
+    board = sorted(((i, names[i], v) for i, v in pts.items() if i in names and v > 0), key=lambda x: (-x[2], x[1]))
+    return board[:limit]
+
+
+def award_week(d):
+    """Podium de la semaine écoulée : +100 / +60 / +30 XP, une seule fois (au premier passage de la nouvelle semaine)."""
+    key = "wk-" + str(week_start(-1))
+    for k, (i, name, v) in enumerate(week_board(d, -1, 3)):
+        if not d.execute("SELECT 1 FROM daily WHERE user_id=? AND day=?", (i, key)).fetchone():
+            xp = (100, 60, 30)[k]
+            d.execute("INSERT INTO daily(user_id,day,xp) VALUES(?,?,?) ON CONFLICT DO NOTHING", (i, key, xp))
+            d.execute("INSERT INTO notifs(user_id,text,link,created) VALUES(?,?,?,?)", (i, f"{('🥇', '🥈', '🥉')[k]} N°{k + 1} du classement de la semaine : +{xp} XP !", "/classement", now()))
+
+
+@app.route("/classement")
+@login_required
+def leaderboard():
+    d = db()
+    award_week(d)
+    board = week_board(d, 0, 30)
+    mine = next((dict(rank=k + 1, pts=v) for k, (i, _n, v) in enumerate(board) if i == uid()), None)
+    last = week_board(d, -1, 3)
+    left = (week_start(1) - datetime.now(timezone.utc).date()).days
+    return render_template("lb.html", title="Classement", board=board, mine=mine, last=last, left=left)
 
 
 def user_xp(d, u, stt=None):
@@ -1583,7 +1964,8 @@ def user_xp(d, u, stt=None):
                   "(SELECT COUNT(*) FROM dplays p WHERE p.user_id=? AND p.done=1 AND EXISTS (SELECT 1 FROM dplays o WHERE o.duel_id=p.duel_id AND o.done=1 AND o.user_id<>p.user_id) "
                   "AND NOT EXISTS (SELECT 1 FROM dplays o WHERE o.duel_id=p.duel_id AND o.done=1 AND o.user_id<>p.user_id AND (o.good>p.good OR (o.good=p.good AND o.ms<p.ms)))) dw",
                   (i, i, i)).fetchone()
-    xp = stt["nq"] * 10 + r["g"] * 3 + stt["np"] * 15 + stt["lk"] * 3 + stt["nc"] * 5 + stt["ng"] * 10 + stt["nf"] * 2 + r["dp"] * 10 + r["dw"] * 25
+    bonus = d.execute("SELECT COALESCE(SUM(xp),0) FROM daily WHERE user_id=?", (i,)).fetchone()[0]
+    xp = bonus + stt["nq"] * 10 + r["g"] * 3 + stt["np"] * 15 + stt["lk"] * 3 + stt["nc"] * 5 + stt["ng"] * 10 + stt["nf"] * 2 + r["dp"] * 10 + r["dw"] * 25
     k = max(n for n, (t, _e, _nm) in enumerate(RANKS) if xp >= t)
     nxt = RANKS[k + 1] if k + 1 < len(RANKS) else None
     pct = 100 if not nxt else max(0, min(100, int(100 * (xp - RANKS[k][0]) / (nxt[0] - RANKS[k][0]))))
@@ -1747,6 +2129,7 @@ BADGES = [  # (emoji, nom, description, clé de stat, seuil)
     ("💬", "Bavard", "10 commentaires", "nc", 10), ("👥", "Sociable", "Rejoindre un groupe", "ng", 1),
     ("🤝", "Pilier de groupes", "Rejoindre 3 groupes", "ng", 3), ("⭐", "Collectionneur", "10 séries en favori", "nf", 10),
     ("🎮", "Quizzeur", "Jouer un quiz", "nq", 1), ("🔥", "Accro au quiz", "10 quiz joués", "nq", 10), ("🧠", "Cerveau", "8/10 au quiz", "best", 8),
+    ("🎖️", "Recrue", "Terminer les missions de bienvenue", "rec", 1),
 ]
 
 
@@ -1754,8 +2137,9 @@ def user_stats(d, u):
     i = u["id"]
     r = d.execute("SELECT (SELECT COUNT(*) FROM posts WHERE user_id=?) np,(SELECT COUNT(*) FROM likes l JOIN posts p ON p.id=l.post_id WHERE p.user_id=?) lk,"
                   "(SELECT COUNT(*) FROM comments WHERE user_id=?) nc,(SELECT COUNT(*) FROM members WHERE user_id=?) ng,"
-                  "(SELECT COUNT(*) FROM favs WHERE user_id=?) nf,(SELECT COUNT(*) FROM scores WHERE user_id=?) nq,(SELECT COALESCE(MAX(good),0) FROM scores WHERE user_id=?) best",
-                  (i,) * 7).fetchone()
+                  "(SELECT COUNT(*) FROM favs WHERE user_id=?) nf,(SELECT COUNT(*) FROM scores WHERE user_id=?) nq,(SELECT COALESCE(MAX(good),0) FROM scores WHERE user_id=?) best,"
+                  "(SELECT COUNT(*) FROM daily WHERE user_id=? AND day='mis-all') rec",
+                  (i,) * 8).fetchone()
     stt = dict(r)
     return stt, [dict(e=e, n=n, d=ds, ok=stt[k] >= t) for e, n, ds, k, t in BADGES]
 
@@ -2494,7 +2878,7 @@ def secure(r):
     h["X-Content-Type-Options"] = "nosniff"
     h["X-Frame-Options"] = "DENY"
     h.setdefault("Referrer-Policy", "same-origin")
-    h["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
+    h["Permissions-Policy"] = "geolocation=(), camera=(), microphone=(self)"
     if request.path != "/sw.js":          # le service worker doit pouvoir charger les affiches externes
         h["Content-Security-Policy"] = CSP
     if PROD:
@@ -2648,6 +3032,10 @@ a.it.on{background:var(--card2)}a.it.on .grow{color:var(--or2)}
 .wl{min-height:82vh;display:flex;flex-direction:column;justify-content:center;text-align:center}.wlogo{font-size:2.2rem;font-weight:800}.wlogo b{color:var(--or)}
 .wl h1{font-size:2.3rem;line-height:1.1;margin:18px 0 10px}.wl .or{color:var(--or)}.wfoot{margin-top:28px;font-size:.8rem;color:var(--mut)}.wfoot a{color:var(--mut)}
 .inst{max-width:440px;margin:4vh auto 30px;text-align:center}.inst h1{font-size:1.7rem;margin:14px 0 6px}.inst ol{list-style:none;margin:18px 0 0;padding:0;text-align:left;counter-reset:s}.inst li{counter-increment:s;display:flex;gap:12px;align-items:flex-start;padding:12px 14px;margin-bottom:10px;border-radius:14px;background:var(--card,rgba(255,255,255,.06))}.inst li:before{content:counter(s);flex:none;width:26px;height:26px;border-radius:50%;background:var(--or);color:#fff;font-weight:800;display:flex;align-items:center;justify-content:center;font-size:.85rem}.inst li small{display:block;color:var(--mut);margin-top:2px}.inst .ok{color:#4cd18a;font-weight:700}.inst .warn{background:rgba(255,106,26,.14);border-radius:12px;padding:10px 12px;margin:12px 0;text-align:left;font-size:.9rem}
+.skc{margin:10px 0;border:1px solid #ff6a1a66;background:linear-gradient(135deg,#ff6a1a22,#ff3d7122)}.skc.ok{border-color:var(--line);background:var(--card)}
+.skf{font-size:2.2rem;animation:flame 1.4s ease-in-out infinite}.skc.ok .skf{animation:none;filter:grayscale(.3)}@keyframes flame{50%{transform:scale(1.15) rotate(-5deg)}}
+.skw{display:flex;gap:6px;margin:12px 0}.skw i{flex:1;text-align:center;font:700 .72rem/30px system-ui;font-style:normal;border-radius:10px;background:var(--card2);color:var(--mut)}.skw i.on{background:linear-gradient(135deg,var(--or),#ff3d71);color:#fff}
+.dcc{display:block;margin:10px 0;color:inherit;text-decoration:none}.dcc:active{transform:scale(.985)}.dct{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:10px;font-size:.88rem}
 .rkm{margin:10px 0}.rke{font-size:2rem}.rkm .meter{margin:10px 0 6px}.rkm .meter i{background:linear-gradient(90deg,var(--or),var(--or2))}
 .xpr summary{cursor:pointer;color:var(--or2);font-weight:600;font-size:.85rem;margin:2px 0 8px}.xpr ul{margin:0 0 10px;padding:0;list-style:none}.xpr li{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);font-size:.88rem}.xpr li b{color:var(--or2)}
 .dfh{text-align:center;margin:6px 0 12px}.dfb{font-size:2.6rem}
@@ -2781,6 +3169,16 @@ T["base.html"] = r"""{% from "m.html" import navlist, pref with context %}<!doct
 {% if not bare and me %}<nav class="tabs"><div>{% for h,i,l in [('/','home','Découverte'),('/communautes','users','Groupes'),('/quiz','game','Quiz'),('/catalogue','compass','Catalogue'),('/profil/'+me.username if me else '/connexion','user','Profil')] %}
 <a href="{{ h }}" class="{{ 'on' if (path==h or (h!='/' and path.startswith(h[:6]))) }} {{ 'mid' if i=='game' }}">{{ ic(i) }}{{ l }}{% if i=='users' and gunread %}<b class="nb">{{ gunread if gunread<100 else '99+' }}</b>{% endif %}</a>{% endfor %}</div></nav>{% endif %}{% if me %}<script>setInterval(function(){if(document.hidden)return;fetch('/api/groupes/non-lus',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(d){var a=document.querySelector('.tabs a[href="/communautes"]');if(!a)return;var b=a.querySelector('.nb');if(d.n>0){if(!b){b=document.createElement('b');b.className='nb';a.appendChild(b)}b.textContent=d.n>99?'99+':d.n}else if(b)b.remove()}).catch(function(){})},40000)</script>{% endif %}<script>if('serviceWorker' in navigator)addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){})});var DP;addEventListener('beforeinstallprompt',function(e){e.preventDefault();DP=e});
 function installApp(){if(DP){DP.prompt();DP=null}else alert("Menu ⋮ du navigateur → « Installer l'application » ou « Ajouter à l'écran d'accueil ».")}</script><script>var CSRF="{{ session.get('csrf','') }}";
+function sxPushSync(sub){return fetch('/api/push/abonner',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF':CSRF},body:JSON.stringify(sub.toJSON())})}
+function sxPush(ask){if(!('serviceWorker' in navigator)||!('PushManager' in window)||!window.Notification)return Promise.resolve(false);
+ if(Notification.permission==='denied'){if(ask)sxToast('Notifications bloquées : touche le cadenas \u00e0 c\u00f4t\u00e9 de l\u2019adresse > Autorisations.',1);return Promise.resolve(false)}
+ if(Notification.permission!=='granted'&&!ask)return Promise.resolve(false);
+ return (Notification.permission==='granted'?Promise.resolve('granted'):Notification.requestPermission()).then(function(p){if(p!=='granted')return false;
+  return navigator.serviceWorker.register('/push-sw.js').then(function(){return navigator.serviceWorker.ready}).then(function(reg){return fetch('/api/push/cle',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(k){
+   if(!k.key)throw 0;var raw=atob(k.key.replace(/-/g,'+').replace(/_/g,'/')),u=new Uint8Array(raw.length);for(var i=0;i<raw.length;i++)u[i]=raw.charCodeAt(i);
+   return reg.pushManager.getSubscription().then(function(s){return s||reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:u})})})}).then(function(sub){return sxPushSync(sub)}).then(function(){if(ask)sxToast('Rappels activ\u00e9s \ud83d\udd25');var b=document.getElementById('pushcard');if(b)b.hidden=true;return true})})
+  .catch(function(){if(ask)sxToast('Impossible d\u2019activer les rappels sur ce navigateur.',1);return false})}
+window.addEventListener('load',function(){try{sxPush(false);var b=document.getElementById('pushcard');if(b&&'serviceWorker' in navigator&&'PushManager' in window&&window.Notification&&Notification.permission==='default')b.hidden=false}catch(e){}});
 function sxLogout(e){e.preventDefault();var f=e.target,b=f.querySelector('button');if(b)b.disabled=true;sxToast('D\u00e9connexion\u2026');var gone=false;
  function go(){if(gone)return;gone=true;location.replace('/')}
  var clean=[];try{if(window.caches)clean.push(caches.keys().then(function(k){return Promise.all(k.map(function(x){return caches.delete(x)}))}))}catch(x){}
@@ -2880,6 +3278,13 @@ $('dadd').onclick=function(){var t=$('dt').value.trim(),u=$('du').value.trim();i
  var q=new URLSearchParams({t:t,u:u,p:$('dp').value,v:$('dv').value.trim(),s:$('ds').value.trim(),d:$('dd').value.trim()}),b=this;b.disabled=true;
  fetch('/api/admin/telechargement?'+q,{method:'POST',headers:{'Content-Type':'image/jpeg','X-CSRF':csrf},body:blob||'',credentials:'same-origin'}).then(function(r){return r.json().then(function(d){if(!r.ok||!d.ok)throw new Error(d.error||'Envoi impossible ('+r.status+').');location.href='/admin/telechargements'})}).catch(function(e){er(e.message);b.disabled=false})}})()</script>{% endblock %}"""
 
+T["lb.html"] = r"""{% extends "base.html" %}{% set back='/' %}{% block c %}
+<h1 style="margin:6px 0 2px">🏅 Classement de la semaine</h1><p class="mut" style="margin:0 0 12px">Remis à zéro dans {{ left }} jour{{ 's' if left>1 }} (lundi). Les 3 premiers gagnent +100 / +60 / +30 XP.</p>
+{% if mine %}<div class="card skc"><b>Tu es n°{{ mine.rank }}</b> avec {{ mine.pts }} points. Continue !</div>{% else %}<div class="card skc"><b>Tu n'es pas encore classé.</b> <span class="mut">Joue un quiz, publie, commente ou écris dans un groupe pour gagner des points.</span></div>{% endif %}
+<div class="card" style="padding:4px 14px">{% for i,n,v in board %}<a href="/profil/{{ n }}" class="row" style="align-items:center;padding:10px 0;color:inherit;text-decoration:none;{{ 'border-top:1px solid var(--line)' if not loop.first }}"><b style="width:34px;font-size:1.05rem">{{ ['🥇','🥈','🥉'][loop.index0] if loop.index<=3 else loop.index }}</b>{{ ava(n,34) }}<span class="grow" style="{{ 'font-weight:800' if me and n==me.username }}">{{ n }}</span><b style="color:var(--or2)">{{ v }} pts</b></a>{% else %}<p class="mut" style="text-align:center;padding:16px">Personne n'a encore de points cette semaine. Sois le premier ! 👑</p>{% endfor %}</div>
+<div class="card"><b>Comment gagner des points ?</b><ul class="mut" style="margin:8px 0 0;padding-left:18px;line-height:1.7"><li>Jouer un quiz : 10 + 3 par bonne réponse</li><li>Publier un post : 15 · Commenter : 5</li><li>Écrire dans un groupe : 2 (max 60/semaine)</li><li>Bonus du jour, rituel, podium du tournoi : leurs XP comptent aussi</li></ul></div>
+{% if last %}<h2>Podium de la semaine dernière</h2><div class="card">{% for i,n,v in last %}<div class="row" style="padding:4px 0"><span>{{ ['🥇','🥈','🥉'][loop.index0] }}</span><b class="grow">{{ n }}</b><span class="mut">{{ v }} pts</span></div>{% endfor %}</div>{% endif %}
+{% endblock %}"""
 T["rk.html"] = r"""{% macro rkcard(rk) %}<div class="card rkm"><div class="row" style="align-items:center"><span class="rke">{{ rk.emoji }}</span><div class="grow"><b style="font-size:1.05rem">{{ rk.name }}</b><small class="mut" style="display:block">Niveau {{ rk.lvl }} · {{ rk.xp }} XP</small></div></div><div class="meter"><i style="width:{{ rk.pct }}%"></i></div><small class="mut">{% if rk.nxt %}Encore {{ rk.need }} XP pour devenir {{ rk.nxt }}{% else %}Rang maximum atteint 🌟{% endif %}</small></div>{% endmacro %}
 {% macro xprules() %}<details class="xpr"><summary>Comment gagner de l'XP ?</summary><ul>{% for a,b in XP_RULES %}<li><span>{{ a }}</span><b>{{ b }} XP</b></li>{% endfor %}</ul></details>{% endmacro %}"""
 
@@ -3011,6 +3416,19 @@ T["home.html"] = r"""{% extends "base.html" %}{% from "rk.html" import rkcard %}
 <div class="stories" id="stories"></div>
 <div class="pills"><a class="pill {{ 'on' if tab=='decouverte' }}" href="/">{{ ic('compass',16) }} Découverte</a><a class="pill {{ 'on' if tab=='suivis' }}" href="/?t=suivis">{{ ic('star',16) }} Mes séries</a><a class="pill" href="/catalogue?t=planning">{{ ic('home',16) }} Planning</a><a class="pill" href="/quiz">{{ ic('game',16) }} Quiz</a></div>
 {% if events %}<div class="row" style="margin:6px 0 0"><h2 class="grow" style="margin:10px 0">À la une</h2><a href="/evenements" style="font-size:.8rem;color:var(--or2)">Tout voir ›</a></div><div class="evstrip">{% for e in events %}{{ evcard(e) }}{% endfor %}</div>{% endif %}
+{% if sk %}<div class="card dcc" id="pushcard" hidden><div class="row" style="align-items:center"><span class="skf" style="animation:none">🔔</span><div class="grow"><b>Ne perds plus ta série</b><small class="mut" style="display:block">Reçois un rappel sur ton téléphone avant que ta série se perde.</small></div></div><button type="button" class="btn w" style="margin-top:10px" onclick="sxPush(true)">Activer les rappels</button></div>{% endif %}
+{% if ms %}<div class="card skc"><div class="row" style="align-items:center"><span class="skf" style="animation:none">🎯</span><div class="grow"><b style="font-size:1.05rem">Missions de bienvenue · {{ ms.done }}/{{ ms.total }}</b><small class="mut" style="display:block">Termine tout pour le badge 🎖️ Recrue et +50 XP · encore {{ ms.left }} jour{{ 's' if ms.left>1 }}</small></div></div>
+<div class="meter" style="margin:10px 0 6px"><i style="width:{{ (100*ms.done/ms.total)|int }}%"></i></div>
+{% for m in ms['items'] %}<a href="{{ m.link }}" class="row" style="align-items:center;padding:7px 0;color:inherit;text-decoration:none;{{ 'opacity:.55' if m.ok }}"><span>{{ '✅' if m.ok else '⬜' }}</span><span class="grow" style="{{ 'text-decoration:line-through' if m.ok }}">{{ m.title }}</span><b style="color:var(--or2);font-size:.82rem">+{{ m.xp }} XP</b></a>{% endfor %}</div>{% endif %}
+{% if sk %}<div class="card skc{{ ' ok' if sk.done }}"><div class="row" style="align-items:center"><span class="skf">🔥</span><div class="grow"><b style="font-size:1.05rem">{{ sk.n }} jour{{ 's' if sk.n>1 }} d'affilée</b><small class="mut" style="display:block">{% if sk.done %}Bonus du jour récupéré ✅ Reviens demain pour +{{ sk.bonus }} XP{% elif sk.n %}Ne casse pas ta série ! Jour {{ sk.after }} : +{{ sk.bonus }} XP{% else %}Commence ta série : +{{ sk.bonus }} XP aujourd'hui{% endif %}</small></div></div>
+<div class="skw">{% for w in sk.week %}<i class="{{ 'on' if w.ok }}">{{ w.d }}</i>{% endfor %}</div>
+{% if sk.ms %}<small class="mut" style="display:block;margin-bottom:8px">🎁 Prochain cadeau : {{ sk.ms }} jours (+{{ sk.ms_xp }} XP){% if sk.ms_in %}, encore {{ sk.ms_in }} jour{{ 's' if sk.ms_in>1 }}{% endif %}</small>{% endif %}
+{% if not sk.done %}<form method="post" action="/bonus-du-jour">{{ csrf() }}<button class="btn w">🎁 Récupérer +{{ sk.bonus }} XP</button></form>{% endif %}</div>{% endif %}
+<a class="card dcc" href="/quiz"><div class="row" style="align-items:center"><span class="skf" style="animation:none">⚔️</span><div class="grow"><b style="font-size:1.05rem">Tournoi du jour</b><small class="mut" style="display:block">10 questions · {{ dc.n }} joueur{{ 's' if dc.n>1 }} aujourd'hui · fin dans {{ eta//3600 }} h {{ eta%3600//60 }} min</small></div><span class="mut">›</span></div>
+{% if dc.top %}<div class="dct">{% for t in dc.top %}<span>{{ ['🥇','🥈','🥉'][loop.index0] }} <b>{{ t.u }}</b> {{ t.g }}/10</span>{% endfor %}</div>{% else %}<small class="mut" style="display:block;margin-top:8px">Personne n'a encore joué : prends la 1re place 👑</small>{% endif %}
+<small style="display:block;margin-top:8px;color:var(--or2);font-weight:700">{% if dc.mine %}Tu es n°{{ dc.mine.rank }} avec {{ dc.mine.g }}/10{% else %}Joue pour tenter le podium : +30 / +20 / +10 XP{% endif %}{% if dc.champ %} · 👑 hier : {{ dc.champ.u }}{% endif %}</small></a>
+<a class="card dcc" href="/communautes"><div class="row" style="align-items:center"><span class="skf" style="animation:none">🎯</span><div class="grow"><b style="font-size:1.05rem">Rituel du jour</b><small class="mut" style="display:block">{{ rit }}</small></div><span class="mut">›</span></div><small style="display:block;margin-top:8px;color:var(--or2);font-weight:700">Réponds dans un de tes groupes : +10 XP</small></a>
+{% if wk %}<a class="card dcc" href="/classement"><div class="row" style="align-items:center"><span class="skf" style="animation:none">🏅</span><div class="grow"><b style="font-size:1.05rem">Classement de la semaine</b><small class="mut" style="display:block">Remis à zéro chaque lundi · podium : +100 / +60 / +30 XP</small></div><span class="mut">›</span></div><div class="dct">{% for i,n,v in wk %}<span>{{ ['🥇','🥈','🥉'][loop.index0] }} <b>{{ n }}</b> {{ v }} pts</span>{% endfor %}</div></a>{% endif %}
 {% if rk %}{{ rkcard(rk) }}<p class="row" style="margin:-4px 0 10px"><a class="btn s grow" href="/carte/{{ me.username }}">🎴 Ma carte Otaku</a><a class="btn s grow" href="/quiz" style="background:linear-gradient(100deg,#ff3d71,var(--or))">⚔️ Défier un ami</a></p>{% endif %}
 <a class="promo" href="/quiz"><span class="lg">TKN</span><span><b>Le prochain tournoi solo arrive bientôt</b><small>Démarrage dans {{ (eta//3600) }}h {{ (eta%3600//60) }}m — 10 questions, 15 s chacune</small></span></a>
 {% if me %}<form method="post" action="/publier" class="card pform">{{ csrf() }}<div class="row">{{ ava(me.username,36) }}<textarea name="body" maxlength="1000" placeholder="Partage ton avis, un spoiler (avec précaution)…" style="min-height:52px"></textarea></div>{{ ptools() }}</form>
@@ -3114,6 +3532,8 @@ window.goto=function(id){var e=$('m'+id);if(!e)return true;e.scrollIntoView({beh
 <div class="gcover" {% if c.cv %}style="background-image:url(/g/{{ c.id }}/cover?v={{ c.cv }})"{% endif %}></div>
 <div class="ghd2">{{ gav(c,84) }}<div class="grow" style="min-width:0;padding-bottom:4px"><h1 style="margin:0;font-size:1.3rem">{{ c.name }}</h1><small class="mut">{% if c.topic %}{{ c.topic }} · {% endif %}<a href="/communaute/{{ c.id }}/membres" style="color:var(--or2)">{{ nmem }} membre{{ 's' if nmem>1 }} ›</a></small></div></div>
 {% if c.descr %}<p class="mut" style="margin:10px 2px 0">{{ c.descr }}</p>{% endif %}<small class="mut" style="display:block;margin:6px 2px 0">📎 Photos, vidéos et vocaux conservés {{ MEDIA_DAYS }} jours</small>
+{% if joined %}<div class="card dcc" style="margin:12px 0 0"><b>🎯 Rituel du jour</b><p style="margin:6px 0 4px">{{ rit }}</p><small class="mut" style="display:block">{{ rit_n }} membre{{ 's' if rit_n>1 }} ont répondu ici aujourd'hui</small>{% if rit_done %}<small style="display:block;margin-top:8px;color:var(--or2);font-weight:700">✅ Tu as déjà gagné tes +10 XP du jour</small>{% endif %}
+<button type="button" class="btn s" style="margin-top:10px" onclick="var t=$('cbody');t.value='🎯 '+{{ rit|tojson }}+'\n';t.dispatchEvent(new Event('input'));t.focus();t.setSelectionRange(t.value.length,t.value.length)">Répondre{{ '' if rit_done else ' (+10 XP)' }}</button></div>{% endif %}
 <div class="row" style="margin:12px 0 4px;flex-wrap:wrap">{% if me and not joined %}<form method="post" style="flex:1 1 200px">{{ csrf() }}<input type="hidden" name="action" value="join"><button class="btn w" style="white-space:nowrap">Rejoindre le groupe</button></form>{% elif joined %}<span class="gj" style="padding:9px 16px">✓ Membre</span>{% elif not me %}<a class="btn grow" href="/connexion?next=/communaute/{{ c.id }}" style="text-align:center">Connecte-toi pour participer</a>{% endif %}
 {% if can_edit %}<button type="button" class="btn s g" onclick="openSheet('esheet')">{{ ic('edit',16) }} Personnaliser</button>{% endif %}<span class="grow"></span>
 {% if joined %}<details class="more"><summary>{{ ic('dots',22) }}</summary><div class="mn"><form method="post" action="/groupe/{{ c.id }}/sourdine">{{ csrf() }}<button>{{ '🔔 Réactiver les alertes' if muted else '🔕 Mettre en sourdine' }}</button></form><form method="post">{{ csrf() }}<input type="hidden" name="action" value="join"><button onclick="return confirm('Quitter le groupe ?')">{{ ic('out',18) }} Quitter le groupe</button></form></div></details>{% endif %}</div>
@@ -3195,7 +3615,7 @@ $('mic').onclick=function(){navigator.mediaDevices.getUserMedia({audio:true}).th
   if(r.cancel||!ch.length||Date.now()-r.t0<800)return;var b=new Blob(ch,{type:r.mr.mimeType||mt||'audio/webm'});pend={kind:'audio',blob:b,mime:b.type};send()};
  r.mr.start();$('rec').hidden=false;$('cf').hidden=true;pad();
  r.iv=setInterval(function(){var s=Math.floor((Date.now()-r.t0)/1000);$('rect').textContent=Math.floor(s/60)+':'+('0'+s%60).slice(-2);if(s>=120)r.mr.stop()},250)},
- function(){err("Micro refusé : autorise-le dans les réglages du navigateur.")})};
+ function(){err("Micro refusé : touche le cadenas à côté de l\u2019adresse, puis Autorisations > Micro > Autoriser, et recharge la page.")})};
 $('recok').onclick=function(){if(rec)rec.mr.stop()};$('recx').onclick=function(){if(rec){rec.cancel=true;rec.mr.stop()}};
 window.react=function(pid,e){xhr('/api/groupe/reagir/'+pid,JSON.stringify({e:e}),'application/json').then(function(d){var b=$('rx'+pid);b.innerHTML=d.html;var c=b.querySelector('.rch.on');if(c)c.classList.add('bump')},function(x){err(x.message)})};
 window.zoom=function(src){var o=document.createElement('div');o.className='zoom';o.innerHTML='<img src="'+src+'" alt="">';o.onclick=function(){o.remove()};document.body.appendChild(o)};
@@ -3433,6 +3853,7 @@ T["setup.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><d
 T["err.html"] = r"""{% extends "base.html" %}{% block c %}<div class="auth"><h1 style="font-size:4rem;margin:0;color:var(--or)">{{ code }}</h1><p class="mut">{{ msg or "Oups, cette page n'est pas disponible." }}</p><a class="btn" href="/">Retour à l'accueil</a></div>{% endblock %}"""
 
 app.jinja_loader = DictLoader(T)
+_crypto()   # lance au besoin l'installation en arrière-plan
 app.jinja_env.globals["css"] = CSS
 app.jinja_env.globals.update(WALL=WALL, XP_RULES=XP_RULES, PLATS=PLATS, host_of=host_of, REACTS=REACTS, MEDIA_MAX=MEDIA_MAX, snip=snip, MEDIA_DAYS=MEDIA_DAYS, MEDIA_CAP_MB=MEDIA_CAP_MB, EVT_KINDS=EVT_KINDS, fdate=fdate, poll_of=poll_of, gav=gav)
 app.jinja_env.globals["js"] = '\nfunction $(x){return document.getElementById(x)}\nfunction esc(s){return String(s==null?\'\':s).replace(/[&<>"\']/g,function(c){return{\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]})}\nvar JK=\'https://api.jikan.moe/v4\',DAYS=[\'monday\',\'tuesday\',\'wednesday\',\'thursday\',\'friday\',\'saturday\',\'sunday\'];\nfunction nerr(e){var m=e&&e.message||String(e);return e&&e.name==\'AbortError\'?\'délai dépassé\':(/Failed to fetch|Load failed|NetworkError/i.test(m)?\'connexion impossible\':m)}\nfunction req(u,o){var ac=new AbortController(),t=setTimeout(function(){ac.abort()},9000);o=o||{};o.signal=ac.signal;\n return fetch(u,o).then(function(r){clearTimeout(t);if(!r.ok)throw new Error(\'HTTP \'+r.status);return r.json()}).catch(function(e){clearTimeout(t);throw new Error(nerr(e))})}\nfunction get(u){return req(u)}\nfunction AL(q,v){return req(\'https://graphql.anilist.co\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({query:q,variables:v||{}})}).then(function(d){if(d.errors)throw new Error(d.errors[0].message);return d.data})}\nfunction purge(){Object.keys(localStorage).forEach(function(x){if(x.indexOf(\'c:\')==0)localStorage.removeItem(x)})}\nfunction cache(k,ttl,fn){k=\'c:\'+k;var c=null;try{c=JSON.parse(localStorage.getItem(k))}catch(e){}\n if(c&&Date.now()-c.t<ttl*6e4)return Promise.resolve(c.d);\n return fn().then(function(d){try{localStorage.setItem(k,JSON.stringify({t:Date.now(),d:d}))}catch(e){purge()}return d},function(e){if(c)return c.d;throw e})}\nfunction strip(s){return String(s||\'\').replace(/<[^>]*>/g,\' \').replace(/\\s+/g,\' \').trim()}\nfunction uniq(l){var s={};return l.filter(function(x){return x.id&&!s[x.id]&&(s[x.id]=1)})}\nfunction shuf(a){for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1)),t=a[i];a[i]=a[j];a[j]=t}return a}\nvar MF=\'idMal isAdult title{romaji english} coverImage{large} averageScore seasonYear startDate{year} episodes chapters format genres studios(isMain:true){nodes{name}} description(asHtml:false)\';\nfunction alm(m){return{id:m.idMal,title:(m.title&&(m.title.english||m.title.romaji))||\'?\',img:(m.coverImage&&m.coverImage.large)||\'\',score:m.averageScore?Math.round(m.averageScore)/10:null,\n year:m.seasonYear||(m.startDate&&m.startDate.year)||null,eps:m.episodes||m.chapters||null,type:m.format||\'\',genres:(m.genres||[]).join(\', \'),\n studio:((m.studios&&m.studios.nodes)||[]).map(function(n){return n.name}).join(\', \'),syn:strip(m.description)}}\nfunction nm(it){var im=(it.images&&it.images.jpg)||{};return{id:it.mal_id,title:it.title_english||it.title||\'?\',img:im.large_image_url||im.image_url||\'\',score:it.score,\n year:it.year||(it.aired&&it.aired.prop&&it.aired.prop.from&&it.aired.prop.from.year),syn:(it.synopsis||\'\').trim(),type:it.type,eps:it.episodes||it.chapters,\n genres:(it.genres||[]).map(function(g){return g.name}).join(\', \'),studio:(it.studios||[]).map(function(g){return g.name}).join(\', \')}}\nfunction fin(a){return uniq(a.filter(function(m){return m&&m.idMal&&!m.isAdult}).map(alm))}\nfunction season(){var d=new Date();return{s:[\'WINTER\',\'SPRING\',\'SUMMER\',\'FALL\'][Math.floor(d.getMonth()/3)],y:d.getFullYear()}}\nfunction dayRange(day){var n=new Date(),tm=(n.getDay()+6)%7,d=new Date(n.getFullYear(),n.getMonth(),n.getDate()+DAYS.indexOf(day)-tm),a=Math.floor(d.getTime()/1000);return[a-1,a+86400]}\nvar STOP={moi:1,quand:1,que:1,qui:1,les:1,des:1,une:1,dans:1,sur:1,pour:1,par:1,avec:1,mon:1,mes:1,son:1,ses:1,est:1,sont:1,the:1,and:1,anime:1,manga:1,saison:1};\nfunction kws(q){return q.toLowerCase().normalize(\'NFD\').replace(/[\\u0300-\\u036f]/g,\'\').replace(/[^a-z0-9\\s]/g,\' \').split(/\\s+/).filter(function(w){return w.length>2&&!STOP[w]}).map(function(w){return/^reincarn/.test(w)?\'reincarnated\':w})}\nfunction alQ(q,sort){return AL(\'query($q:String){Page(page:1,perPage:30){media(type:ANIME,isAdult:false,search:$q,sort:\'+sort+\'){\'+MF+\'}}}\',{q:q}).then(function(d){return fin(d.Page.media)})}\nfunction srch(q){return alQ(q,\'SEARCH_MATCH\').then(function(l){if(l.length)return l;var k=kws(q);if(!k.length)return[];\n return alQ(k.join(\' \'),\'SEARCH_MATCH\').then(function(l2){if(l2.length)return l2;\n  return Promise.all(k.map(function(w){return alQ(w,\'POPULARITY_DESC\').catch(function(){return[]})})).then(function(arr){var sc={},by={};arr.forEach(function(a){a.forEach(function(m){by[m.id]=m;sc[m.id]=(sc[m.id]||0)+1})});\n   return Object.keys(by).map(function(i){return by[i]}).sort(function(a,b){return sc[b.id]-sc[a.id]})})})})}\nfunction alList(kind,o,pg){\n if(kind==\'search\')return srch(o.q||\'\');\n if(kind==\'planning\'){var r=dayRange(o.day||\'monday\');return AL(\'query($a:Int,$b:Int){Page(perPage:50){airingSchedules(airingAt_greater:$a,airingAt_lesser:$b,sort:TIME){media{\'+MF+\'}}}}\',{a:r[0],b:r[1]}).then(function(d){return fin(d.Page.airingSchedules.map(function(x){return x.media}))})}\n var v={p:pg,t:kind==\'manga\'?\'MANGA\':\'ANIME\'},decl=\'$p:Int,$t:MediaType\',args=\'type:$t,isAdult:false\',sort=\'POPULARITY_DESC\';\n if(kind==\'saison\'){var z=season();v.s=z.s;v.y=z.y;decl+=\',$s:MediaSeason,$y:Int\';args+=\',season:$s,seasonYear:$y\'}\n else if(kind==\'top\'){sort=\'SCORE_DESC\';args+=\',popularity_greater:30000\'}\n else if(kind==\'manga\'){sort=\'SCORE_DESC\';args+=\',popularity_greater:10000\'}\n else if(kind==\'trend\')sort=\'TRENDING_DESC\';\n else if(kind==\'explore\'){sort=o.sort||\'POPULARITY_DESC\';args+=\',popularity_greater:3000\';if(o.genre){v.g=o.genre;decl+=\',$g:String\';args+=\',genre:$g\'}if(o.year){v.a=o.year*10000;v.b=o.year*10000+10000;decl+=\',$a:FuzzyDateInt,$b:FuzzyDateInt\';args+=\',startDate_greater:$a,startDate_lesser:$b\'}if(o.min){v.m=+o.min*10;decl+=\',$m:Int\';args+=\',averageScore_greater:$m\'}}\n  return AL(\'query(\'+decl+\'){Page(page:$p,perPage:30){media(\'+args+\',sort:\'+sort+\'){\'+MF+\'}}}\',v).then(function(d){return fin(d.Page.media)})}\nfunction jkList(kind,o,pg){\n var P={saison:\'/seasons/now?limit=24&sfw=true&page=\'+pg,trend:\'/seasons/now?limit=14&sfw=true\',explore:\'/top/anime?limit=25&sfw=true&page=\'+pg,top:\'/top/anime?limit=25&sfw=true&page=\'+pg,manga:\'/top/manga?limit=24&sfw=true&page=\'+pg,\n  planning:\'/schedules?filter=\'+(o.day||\'monday\')+\'&limit=24&sfw=true\',search:\'/anime?q=\'+encodeURIComponent(o.q||\'\')+\'&limit=12&sfw=true&order_by=popularity\'};\n return get(JK+P[kind]).then(function(d){return uniq((d.data||[]).map(nm))})}\nfunction L(kind,o){o=o||{};var pg=o.page||1;\n return cache([kind,o.day||\'\',pg,o.q||\'\',o.genre||\'\',o.year||\'\',o.sort||\'\',o.min||\'\'].join(\'|\'),30,function(){\n  return alList(kind,o,pg).then(function(l){if(!l.length&&kind!=\'search\')throw new Error(\'liste vide\');return l}).catch(function(e1){return jkList(kind,o,pg).catch(function(e2){throw new Error(\'AniList : \'+e1.message+\' · Jikan : \'+e2.message)})})})}\nfunction M(id,kind){return cache(\'m\'+kind+id,60,function(){\n return AL(\'query($i:Int,$t:MediaType){Media(idMal:$i,type:$t){\'+MF+\' nextAiringEpisode{airingAt episode} trailer{id site} characters(perPage:10,sort:ROLE){nodes{name{full} image{medium}}}}}\',{i:id,t:kind==\'manga\'?\'MANGA\':\'ANIME\'}).then(function(d){var x=d.Media,m=alm(x);\n  m.next=x.nextAiringEpisode||null;m.trailer=x.trailer&&x.trailer.site==\'youtube\'?\'https://youtu.be/\'+x.trailer.id:\'\';m.chars=x.characters.nodes.map(function(c){return{title:c.name.full,img:c.image.medium}});return m})\n .catch(function(e1){return get(JK+\'/\'+(kind==\'manga\'?\'manga\':\'anime\')+\'/\'+id).then(function(d){var m=nm(d.data);m.trailer=(d.data.trailer||{}).url||\'\';m.chars=[];\n  if(kind==\'manga\')return m;return get(JK+\'/anime/\'+id+\'/characters\').then(function(c){m.chars=(c.data||[]).slice(0,10).map(function(x){return{title:x.character.name,img:x.character.images.jpg.image_url}});return m}).catch(function(){return m})})})})}\nfunction skI(n){var h=\'\';for(var i=0;i<n;i++)h+=\'<div class="tile"><div class="sk" style="aspect-ratio:2/3;border-radius:14px"></div><div class="sk" style="height:10px;margin-top:6px;width:70%"></div></div>\';return h}\nfunction skT(n){return\'<div class="grid">\'+skI(n)+\'</div>\'}\nfunction skC(n){var h=\'\';for(var i=0;i<n;i++)h+=\'<div class="st"><div class="sk" style="width:72px;height:72px;border-radius:50%"></div></div>\';return h}\nfunction tileItems(l,k){return l.map(function(m){return\'<a class="tile" href="/serie/\'+m.id+(k==\'manga\'?\'?k=manga\':\'\')+\'"><img src="\'+esc(m.img)+\'" loading="lazy" alt="">\'+(m.score?\'<small>★ \'+m.score+\'</small>\':\'\')+\'<b>\'+esc(m.title)+\'</b></a>\'}).join(\'\')}\nfunction tiles(l,k){return l.length?\'<div class="grid">\'+tileItems(l,k)+\'</div>\':\'<p class="mut" style="text-align:center">Aucun résultat.</p>\'}\nfunction rings(l){return l.map(function(m){return\'<a class="st" href="/serie/\'+m.id+\'"><div class="ring"><img src="\'+esc(m.img)+\'" alt="" loading="lazy"></div><span>\'+esc(m.title)+\'</span></a>\'}).join(\'\')}\nfunction posters(l){return l.map(function(m){return\'<a class="st" style="width:96px" href="/serie/\'+m.id+\'"><img src="\'+esc(m.img)+\'" alt="" loading="lazy" style="border-radius:14px;aspect-ratio:2/3;border:0;object-fit:cover;width:100%"><span>\'+esc(m.title)+\'</span></a>\'}).join(\'\')}\nfunction fail(el,e){el.innerHTML=\'<p class="mut" style="grid-column:1/-1;text-align:center;padding:14px">Sources injoignables.<br><small>\'+esc(e&&e.message||e)+\'</small><br><a href="" style="color:var(--or)">Réessayer</a> · <a href="/diagnostic" style="color:var(--or)">Diagnostic</a></p>\'}\n\nfunction dur(s){s=Math.max(0,s);var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+\' j \'+h+\' h\':h?h+\' h \'+m+\' min\':m+\' min\'}\nfunction NX(ids){if(!ids.length)return Promise.resolve({});return cache(\'nx|\'+ids.join(\',\'),30,function(){\n return AL(\'query($i:[Int]){Page(perPage:50){media(idMal_in:$i,type:ANIME){idMal title{romaji english} coverImage{large} nextAiringEpisode{airingAt episode}}}}\',{i:ids.slice(0,50)}).then(function(d){var o={};\n  d.Page.media.forEach(function(m){if(m.nextAiringEpisode)o[m.idMal]={at:m.nextAiringEpisode.airingAt,ep:m.nextAiringEpisode.episode,title:m.title.english||m.title.romaji,img:m.coverImage.large}});return o})})}\n\nfunction fx(b,t){b.innerHTML=\'\';var m={sakura:[\'🌸\',\'fall\'],stars:[\'✨\',\'twk\'],snow:[\'❄️\',\'fall\'],flames:[\'🔥\',\'rise\']}[t];if(!m||(window.matchMedia&&matchMedia(\'(prefers-reduced-motion: reduce)\').matches))return;\n for(var i=0;i<16;i++){var e=document.createElement(\'span\');e.className=\'fxp \'+m[1];e.textContent=m[0];e.style.left=(Math.random()*94)+\'%\';e.style.fontSize=(10+Math.random()*14)+\'px\';\n  e.style.animationDuration=(4+Math.random()*6)+\'s\';e.style.animationDelay=(-Math.random()*8)+\'s\';if(m[1]==\'twk\')e.style.top=(Math.random()*85)+\'%\';b.appendChild(e)}}\n'
