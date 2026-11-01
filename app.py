@@ -172,7 +172,7 @@ MIGRATIONS = (("users", "email TEXT DEFAULT ''"), ("users", "recovery TEXT DEFAU
               ("users", "is_admin INTEGER DEFAULT 0"), ("users", "ban_reason TEXT DEFAULT ''"), ("users", "av INTEGER DEFAULT 0"), ("users", "bv INTEGER DEFAULT 0"),
               ("users", "p_ring TEXT DEFAULT 'none'"), ("users", "p_fx TEXT DEFAULT 'none'"), ("users", "p_name TEXT DEFAULT 'normal'"),
               ("users", "p_banner TEXT DEFAULT 'sunset'"), ("users", "p_color TEXT DEFAULT '#8b5cf6'"), ("users", "p_status TEXT DEFAULT ''"),
-              ("cposts", "mk TEXT DEFAULT ''"), ("cposts", "rid INTEGER DEFAULT 0"), ("cposts", "mal_id INTEGER DEFAULT 0"), ("cposts", "m_title TEXT DEFAULT ''"), ("cposts", "m_img TEXT DEFAULT ''"), ("communities", "pin INTEGER DEFAULT 0"), ("posts", "has_img INTEGER DEFAULT 0"), ("users", "otype TEXT DEFAULT ''"), ("communities", "av INTEGER DEFAULT 0"), ("communities", "cv INTEGER DEFAULT 0"), ("favs", "status TEXT DEFAULT 'voir'"), ("favs", "ep INTEGER DEFAULT 0"), ("favs", "total INTEGER DEFAULT 0"),
+              ("cposts", "mk TEXT DEFAULT ''"), ("cposts", "rid INTEGER DEFAULT 0"), ("cposts", "mal_id INTEGER DEFAULT 0"), ("cposts", "m_title TEXT DEFAULT ''"), ("cposts", "m_img TEXT DEFAULT ''"), ("communities", "pin INTEGER DEFAULT 0"), ("posts", "has_img INTEGER DEFAULT 0"), ("posts", "m_kind TEXT DEFAULT 'anime'"), ("users", "otype TEXT DEFAULT ''"), ("communities", "av INTEGER DEFAULT 0"), ("communities", "cv INTEGER DEFAULT 0"), ("favs", "status TEXT DEFAULT 'voir'"), ("favs", "ep INTEGER DEFAULT 0"), ("favs", "total INTEGER DEFAULT 0"),
               ("favs", "score INTEGER DEFAULT 0"), ("favs", "kind TEXT DEFAULT 'anime'"), ("favs", "updated TEXT DEFAULT ''"))
 
 
@@ -572,6 +572,7 @@ def nav(where="menu"):
 def inject():
     u = me()
     unread, gunread, munread, aunread = 0, 0, 0, 0
+    bonus_due = False
     if u:
         try:
             r = db().execute("SELECT (SELECT COUNT(*) FROM notifs WHERE user_id=? AND read=0),"
@@ -581,10 +582,11 @@ def inject():
             gunread = sum(x for x, mu in group_unread(db()).values() if not mu)
             aunread = ann_unread(db(), u["id"])
             g.aunread = aunread
+            bonus_due = not db().execute("SELECT 1 FROM daily WHERE user_id=? AND day=?", (u["id"], str(datetime.now(timezone.utc).date()))).fetchone()
         except DBError:
             log.exception("inject : compteur de notifications")
             safe_rollback()
-    return dict(setup_open=bool(u) and not admin_exists(), durable=DURABLE, STATUSES=STATUSES, REASONS=REASONS, is_admin=is_admin(), me=u, ic=ic, nav=nav, ava=ava, ago=ago, unread=unread, gunread=gunread, munread=munread, aunread=aunread, path=request.path,
+    return dict(bonus_due=bonus_due, setup_open=bool(u) and not admin_exists(), durable=DURABLE, STATUSES=STATUSES, REASONS=REASONS, is_admin=is_admin(), me=u, ic=ic, nav=nav, ava=ava, ago=ago, unread=unread, gunread=gunread, munread=munread, aunread=aunread, path=request.path,
                 csrf=lambda: Markup(f'<input type="hidden" name="_csrf" value="{session.setdefault("csrf", secrets.token_hex(16))}">'))
 
 
@@ -639,13 +641,16 @@ def index():
     tab = request.args.get("t", "decouverte")
     conds, args = ["p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id=?)"], [uid(), uid()]
     if tab == "suivis" and me():
-        conds.append("p.mal_id IN (SELECT mal_id FROM favs WHERE user_id=?)")
+        conds.append("EXISTS (SELECT 1 FROM favs f WHERE f.user_id=? AND f.mal_id=p.mal_id AND f.kind=COALESCE(p.m_kind,'anime'))")
         args.append(uid())
     posts = db().execute(POSTQ + "WHERE " + " AND ".join(conds) + " ORDER BY p.id DESC LIMIT 40", args).fetchall()
     watch = [r[0] for r in db().execute("SELECT mal_id FROM favs WHERE user_id=? AND status IN('cours','voir') AND kind='anime' ORDER BY updated DESC LIMIT 50", (uid(),))] if me() else []
     trailers = db().execute("SELECT * FROM trailers ORDER BY pos DESC,id DESC LIMIT 8").fetchall()
     unread_a = [a for a in ann_live(db(), uid()) if not a["seen"]] if me() else []
-    return render_template("home.html", title="Découverte", tab=tab, anns=unread_a[:3], ann_more=max(0, len(unread_a) - 3), ann_total=len(unread_a), posts=posts, eta=next_tournament(), watch=watch, trailers=trailers, events=evt_live(db(), 6), dlcount=db().execute("SELECT COUNT(*) FROM downloads WHERE hidden=0").fetchone()[0], rk=(user_xp(db(), me()) if me() else None), sk=(streak_info(db(), me()["id"]) if me() else None), dc=daily_challenge(db()), rit=ritual_of_day(), ms=(missions(db(), me()) if me() else None), wk=(week_board(db(), 0, 3) if me() else []))
+    if me():   # crédite toujours les missions et le podium (XP), même si la page Profil n'est pas ouverte
+        daily_challenge(db())
+        missions(db(), me())
+    return render_template("home.html", title="Découverte", tab=tab, anns=unread_a[:3], ann_more=max(0, len(unread_a) - 3), ann_total=len(unread_a), posts=posts, watch=watch, trailers=trailers, events=evt_live(db(), 6), dlcount=db().execute("SELECT COUNT(*) FROM downloads WHERE hidden=0").fetchone()[0], rk=(user_xp(db(), me()) if me() else None), sk=(streak_info(db(), me()["id"]) if me() else None))
 
 
 YT_RE = re.compile(r"(?:youtu\.be/|youtube(?:-nocookie)?\.com/(?:watch\?(?:[^#]*&)?v=|embed/|shorts/|live/|v/))([\w-]{11})(?![\w-])")
@@ -853,13 +858,14 @@ def search():
 
 
 def post_mal(src):
-    """Série liée à une publication (depuis un formulaire ou une query) -> (mal_id, titre, image)."""
+    """Série liée à une publication (depuis un formulaire ou une query) -> (mal_id, titre, image, type « anime » ou « manga »)."""
     mid = toint(src.get("mal_id"), 0, 0, 10 ** 9) or None
     t = txt(src.get("m_title"), 120) if mid else None
     img = src.get("m_img", "") if mid else None
-    if img and not img.startswith("https://cdn.myanimelist.net/"):
+    if img and not img.startswith(("https://cdn.myanimelist.net/", "https://s4.anilist.co/")):
         img = ""
-    return mid, t, img
+    kind = "manga" if mid and src.get("m_kind") == "manga" else "anime"
+    return mid, t, img, kind
 
 
 def clean_opts(lst):
@@ -867,9 +873,9 @@ def clean_opts(lst):
     return o if len(o) >= 2 else []
 
 
-def new_post(d, body, mid, t, img, opts, photo=None):
-    pid = d.execute("INSERT INTO posts(user_id,body,mal_id,m_title,m_img,created,has_img) VALUES(?,?,?,?,?,?,?)",
-                    (uid(), body, mid, t, img, now(), 1 if photo else 0)).lastrowid
+def new_post(d, body, mid, t, img, opts, photo=None, kind="anime"):
+    pid = d.execute("INSERT INTO posts(user_id,body,mal_id,m_title,m_img,created,has_img,m_kind) VALUES(?,?,?,?,?,?,?,?)",
+                    (uid(), body, mid, t, img, now(), 1 if photo else 0, kind)).lastrowid
     for i, o in enumerate(opts):
         d.execute("INSERT INTO popts(post_id,label,pos) VALUES(?,?,?)", (pid, o, i))
     if photo:
@@ -884,9 +890,16 @@ def publish():
     if not body or not throttle(f"pub{uid()}", 8, 300):
         flash("Message vide ou trop rapide.", "err")
         return redirect(request.referrer or "/")
-    mid, t, img = post_mal(request.form)
-    new_post(db(), body, mid, t, img, clean_opts(request.form.getlist("opt")))
-    return redirect(request.referrer or "/")
+    mid, t, img, kind = post_mal(request.form)
+    new_post(db(), body, mid, t, img, clean_opts(request.form.getlist("opt")), kind=kind)
+    return redirect("/#feed" if request.form.get("next") == "feed" else (request.referrer or "/"))
+
+
+@app.route("/creer")
+@login_required
+def create_page():
+    """Onglet « Publier » de la barre du bas : écrire un avis, ajouter une photo, lancer un sondage."""
+    return render_template("create.html", title="Publier")
 
 
 @app.route("/api/publier", methods=["POST"])
@@ -913,8 +926,8 @@ def api_publish():
         return jsonify(error="Écris la question de ton sondage."), 400
     if not throttle(f"pub{uid()}", 8, 300):
         return jsonify(error="Doucement ! Réessaie dans un instant."), 429
-    mid, t, img = post_mal(a)
-    return jsonify(ok=True, id=new_post(db(), body, mid, t, img, opts, photo))
+    mid, t, img, kind = post_mal(a)
+    return jsonify(ok=True, id=new_post(db(), body, mid, t, img, opts, photo, kind))
 
 
 def poll_of(pid):
@@ -1005,7 +1018,7 @@ def catalog():
 def media(mid):
     k = "manga" if request.args.get("k") == "manga" else "anime"
     cur = me() and db().execute("SELECT * FROM favs WHERE user_id=? AND mal_id=?", (uid(), mid)).fetchone()
-    posts = db().execute(POSTQ + "WHERE p.mal_id=? AND p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id=?) ORDER BY p.id DESC LIMIT 10", (uid(), mid, uid())).fetchall()
+    posts = db().execute(POSTQ + "WHERE p.mal_id=? AND COALESCE(p.m_kind,'anime')=? AND p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id=?) ORDER BY p.id DESC LIMIT 10", (uid(), mid, k, uid())).fetchall()
     return render_template("media.html", title="Fiche", mid=mid, k=k, cur=cur, posts=posts)
 
 
@@ -1944,8 +1957,8 @@ def send_reminders(d):
         if info["done"] or info["n"] < 1:
             continue
         txt_ = f"Ta série de {info['n']} jour{'s' if info['n'] > 1 else ''} va se perdre à minuit ! Récupère ton bonus : +{info['bonus']} XP"
-        d.execute("INSERT INTO notifs(user_id,text,link,created) VALUES(?,?,?,?)", (i, "🔥 " + txt_, "/", now()))
-        send_push(d, i, "🔥 Ta série va se perdre !", txt_, "/")
+        d.execute("INSERT INTO notifs(user_id,text,link,created) VALUES(?,?,?,?)", (i, "🔥 " + txt_, "/moi", now()))
+        send_push(d, i, "🔥 Ta série va se perdre !", txt_, "/moi")
         sent += 1
     d.commit()
     return sent
@@ -2360,6 +2373,21 @@ def user_stats(d, u):
     return stt, [dict(e=e, n=n, d=ds, ok=stt[k] >= t) for e, n, ds, k, t in BADGES]
 
 
+def today_panel(d, u):
+    """Série, tâches du jour et classement, rangés en haut de mon profil. Appelle aussi daily_challenge() et missions(), qui créditent les XP gagnés."""
+    day = str(datetime.now(timezone.utc).date())
+    board = week_board(d, 0, 30)
+    return dict(sk=streak_info(d, u["id"]), dc=daily_challenge(d), ms=missions(d, u), rit=ritual_of_day(), eta=next_tournament(),
+                rit_done=bool(d.execute("SELECT 1 FROM daily WHERE user_id=? AND day=?", (u["id"], "rit-" + day)).fetchone()),
+                wk=board[:3], rank=next((dict(rank=k + 1, pts=v) for k, (i, _n, v) in enumerate(board) if i == u["id"]), None))
+
+
+@app.route("/moi")
+@login_required
+def my_profile():
+    return redirect("/profil/" + me()["username"])
+
+
 @app.route("/profil/<username>")
 def profile(username):
     d = db()
@@ -2370,8 +2398,10 @@ def profile(username):
     posts = d.execute(POSTQ + "WHERE p.user_id=? ORDER BY p.id DESC LIMIT 30", (uid(), u["id"])).fetchall()
     favs = d.execute("SELECT * FROM favs WHERE user_id=? LIMIT 20", (u["id"],)).fetchall()
     st = d.execute("SELECT COUNT(*) n,COALESCE(MAX(good),0) b FROM scores WHERE user_id=?", (u["id"],)).fetchone()
+    tp = today_panel(d, u) if own else None   # avant le calcul de l'XP : les récompenses du jour sont créditées d'abord
     stt, badges = user_stats(d, u)
-    return render_template("profile.html", title=username, u=u, locked=False, posts=posts, favs=favs, st=st, own=own, stt=stt, badges=badges, rk=user_xp(d, u, stt))
+    return render_template("profile.html", title=username, u=u, locked=False, posts=posts, favs=favs, st=st, own=own, stt=stt, badges=badges, rk=user_xp(d, u, stt), tp=tp,
+                           dlcount=(d.execute("SELECT COUNT(*) FROM downloads WHERE hidden=0").fetchone()[0] if own else 0))
 
 
 @app.route("/u/<username>/<kind>")
@@ -3361,9 +3391,11 @@ a.it.on{background:var(--card2)}a.it.on .grow{color:var(--or2)}
 .dli{width:56px;height:56px;border-radius:14px;object-fit:cover;flex:none;background:var(--card2)}.dlf{display:flex;align-items:center;justify-content:center;font-size:1.6rem}
 .dlc{margin:10px 0}.dlc p{margin:10px 0 0}.dlc .btn{margin-top:12px}
 .evstrip{display:flex;gap:12px;overflow-x:auto;scroll-snap-type:x mandatory;padding:2px 0 12px}
-.evc{position:relative;flex:none;width:86%;max-width:420px;aspect-ratio:16/9;border-radius:18px;overflow:hidden;scroll-snap-align:start;background:var(--card2);display:block;color:#fff}
-.evc img{width:100%;height:100%;object-fit:cover;display:block}
-.evc .evt{position:absolute;left:0;right:0;bottom:0;padding:28px 14px 12px;background:linear-gradient(#0000,#000d)}
+.evc{position:relative;flex:none;width:86%;max-width:420px;border-radius:18px;overflow:hidden;scroll-snap-align:start;background:var(--card2);display:flex;flex-direction:column;color:#fff}
+.evc .evb{position:relative;display:block;aspect-ratio:4/3;overflow:hidden;background:#000}
+.evc .evb::before{content:"";position:absolute;inset:-12%;background:var(--u) center/cover;filter:blur(18px) brightness(.55)}
+.evc img{position:relative;width:100%;height:100%;object-fit:contain;display:block}
+.evc .evt{display:block;padding:11px 14px 13px;background:var(--card2)}
 .evc .evt b{display:block;font-size:1.02rem;line-height:1.2}.evc .evt small{opacity:.85}
 .evk{position:absolute;top:10px;left:10px;background:#000a;backdrop-filter:blur(6px);padding:4px 10px;border-radius:99px;font-size:.72rem;font-weight:700}
 .evgrid{display:grid;gap:14px}.evgrid .evc{width:100%;max-width:none}
@@ -3542,6 +3574,7 @@ html{scroll-padding-top:calc(var(--hh,58px) + 4px)}
 .gch a:active{transform:scale(.96)}
 .qa{gap:16px 8px}
 @media (prefers-reduced-motion:reduce){.snav a{transition:none}}
+.avd{position:relative;display:inline-flex}.avdot{position:absolute;top:-2px;right:-2px;width:14px;height:14px;box-sizing:border-box;border-radius:50%;background:var(--red);border:2px solid var(--bg);animation:pulse 1.6s infinite}
 """
 
 # ───────────────────────────── Templates ─────────────────────────────
@@ -3549,7 +3582,7 @@ POST_MACRO = r"""{% macro flag(kind, id, username) %}{% if me and me.username!=u
 {% macro post(p, full=False) %}<article class="post"><div class="ph">{{ ava(p.username,38) }}<div class="grow"><a href="/profil/{{ p.username }}"><b>{{ p.username }}</b></a><small>{{ ago(p.created) }}</small></div>
 {% if me and me.id==p.user_id %}<form method="post" action="/supprimer/post/{{ p.id }}" onsubmit="return confirm('Supprimer ?')">{{ csrf() }}<button class="btn g s">{{ ic('trash',16) }}</button></form>{% else %}{{ flag('post',p.id,p.username) }}{% endif %}</div>
 {% if p.body %}<p>{{ p.body }}</p>{% endif %}{% if p.has_img==2 %}<div class="gone">📷 Photo expirée (conservée {{ MEDIA_DAYS }} jours)</div>{% endif %}{% if p.has_img==1 %}<img class="pimg" src="/api/post/media/{{ p.id }}?v={{ p.created|replace('-','')|replace(' ','')|replace(':','') }}" alt="Photo" loading="lazy" onclick="zoom(this.src)">{% endif %}{% if p.np %}{{ pollbox(p.id) }}{% endif %}
-{% if p.mal_id %}<a class="att" href="/serie/{{ p.mal_id }}">{% if p.m_img %}<img src="{{ p.m_img }}" loading="lazy" alt="">{% endif %}<div><b>{{ p.m_title }}</b><small class="mut" style="display:block">Voir la fiche →</small></div></a>{% endif %}
+{% if p.mal_id %}<a class="att" href="/serie/{{ p.mal_id }}{{ '?k=manga' if p.m_kind=='manga' }}">{% if p.m_img %}<img src="{{ p.m_img }}" loading="lazy" alt="">{% endif %}<div><b>{{ p.m_title }}</b><small class="mut" style="display:block">Voir la fiche →</small></div></a>{% endif %}
 <div class="act"><form method="post" action="/aimer/{{ p.id }}">{{ csrf() }}<button class="{{ 'on' if p.liked }}">{{ ic('heart',19) }} {{ p.lc }}</button></form><a href="/post/{{ p.id }}">{{ ic('msg',19) }} {{ p.cc }}</a></div></article>{% endmacro %}
 {% macro pollbox(pid) %}{% set pl = poll_of(pid) %}{% set show = pl.mine or not me %}<div class="poll{{ ' vs' if pl.opts|length==2 }}" id="poll{{ pid }}"><div class="pos">{% for o in pl.opts %}<button type="button" class="po{{ ' on' if o.id==pl.mine }}" {% if me %}onclick="vote({{ pid }},{{ o.id }})"{% else %}onclick="location.href='/connexion'"{% endif %}><i style="--p:{{ o.pct if show else 0 }}%"></i><span>{{ o.label }}</span>{% if show %}<b>{{ o.pct }}%</b>{% endif %}</button>{% endfor %}</div><small class="mut">{{ pl.total }} vote{{ 's' if pl.total>1 }}{% if me and not pl.mine %} · vote pour voir les résultats{% endif %}</small></div>{% endmacro %}
 {% macro ptools(poll=True) %}<div class="ptools"><label class="ib" title="Ajouter une photo">{{ ic('image',22) }}<input type="file" class="pph" accept="image/*" hidden></label>{% if poll %}<button type="button" class="ib ppb" title="Créer un sondage">{{ ic('chart',22) }}</button>{% endif %}<span class="grow"></span><button class="btn s">Publier</button></div><div class="pprev" hidden></div>{% if poll %}<div class="ppoll" hidden><small class="mut">Écris ta question plus haut, puis 2 à 4 choix (2 choix = duel « versus »).</small><input name="opt" maxlength="40" placeholder="Choix 1"><input name="opt" maxlength="40" placeholder="Choix 2"><input name="opt" maxlength="40" placeholder="Choix 3 (facultatif)"><input name="opt" maxlength="40" placeholder="Choix 4 (facultatif)"></div>{% endif %}{% endmacro %}
@@ -3565,7 +3598,7 @@ T = {}
 T["m.html"] = POST_MACRO
 T["base.html"] = r"""{% from "m.html" import navlist, pref with context %}<!doctype html><html lang="fr" data-theme="{{ me.theme if me else 'dark' }}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0a0612"><link rel="manifest" href="/manifest.json"><link rel="apple-touch-icon" href="/icon-192.png?v=2"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes"><title>{{ title }} · SenpaiX</title>{% block head %}{% endblock %}<style>{{ css|safe }}</style><script>{{ js|safe }}</script><script>(function(){window.sxSet=function(){try{document.cookie="sx_app=1;path=/;max-age=31536000;SameSite=Lax"+(location.protocol=="https:"?";Secure":"")}catch(e){}};var s=false;try{s=["standalone","fullscreen","minimal-ui"].some(function(m){return matchMedia("(display-mode: "+m+")").matches})||navigator.standalone===true||document.referrer.indexOf("android-app://")==0}catch(e){}window.SX_APP=s;if(s&&document.cookie.indexOf("sx_app=1")<0)window.sxSet()})()</script></head><body>
-{% if not bare %}{% set is_root = path in ['/','/communautes','/quiz','/catalogue'] or (me and path=='/profil/'+me.username) %}<header><div class="top">{% if back %}<a class="ib2" href="{{ back }}" aria-label="Retour">{{ ic('back') }}</a>{% elif not is_root %}<a class="ib2" href="/" aria-label="Retour" onclick="if(history.length>1){history.back()}else{location.href='/'}return false">{{ ic('back') }}</a>{% elif me %}<a href="/profil/{{ me.username }}">{{ ava(me.username,34) }}</a>{% endif %}
+{% if not bare %}{% set is_root = path in ['/','/communautes','/quiz','/catalogue','/creer'] %}<header><div class="top">{% if back %}<a class="ib2" href="{{ back }}" aria-label="Retour">{{ ic('back') }}</a>{% elif not is_root %}<a class="ib2" href="/" aria-label="Retour" onclick="if(history.length>1){history.back()}else{location.href='/'}return false">{{ ic('back') }}</a>{% elif me %}<a class="avd" href="/profil/{{ me.username }}{{ '#serie' if bonus_due }}" aria-label="{{ 'Mon profil · bonus du jour à récupérer' if bonus_due else 'Mon profil' }}">{{ ava(me.username,34) }}{% if bonus_due %}<i class="avdot"></i>{% endif %}</a>{% endif %}
 {% if is_root %}<a class="logo" href="/">Senpai<b>X</b></a>{% else %}<span class="apptitle">{{ title }}</span>{% endif %}<span class="sp"></span>{% if me %}<a href="/recherche">{{ ic('search') }}</a>{% endif %}
 {% if me %}<a class="b" href="/notifications">{{ ic('bell') }}{% if unread %}<i>{{ unread }}</i>{% endif %}</a>{% endif %}
 <button type="button" class="dots" aria-label="Menu" onclick="sxMenu(true)">{{ ic('dots',24) }}</button></div></header>
@@ -3574,7 +3607,7 @@ T["base.html"] = r"""{% from "m.html" import navlist, pref with context %}<!doct
 <div class="db">{% for gr in nav('menu') %}{{ navlist([gr]) }}{% if me and gr.t=='Explorer' %}<div class="sec">Réglages</div><div class="grp">{{ pref('theme', me.theme=='light', 'Thème clair', '', 'sun') }}{{ pref('notify', me.notify, 'Notifications', '', 'bell') }}<a href="/parametres" class="it{{ ' on' if path=='/parametres' }}"><span class="ico">{{ ic('sliders',19) }}</span><span class="grow">Tous les paramètres<small>Confidentialité, sécurité, données</small></span>{{ ic('chev',18) }}</a></div>{% endif %}{% endfor %}
 {% if me %}<div class="grp" style="margin-top:18px"><form method="post" action="/deconnexion" onsubmit="return sxLogout(event)">{{ csrf() }}<button class="it" style="color:#ff6b81"><span class="ico" style="color:#ff6b81">{{ ic('out',19) }}</span><span class="grow">Se déconnecter</span></button></form></div>{% endif %}</div></aside>{% endif %}
 <main>{% if is_admin and not durable %}<a class="flash err" href="/admin" style="display:block">⚠️ Stockage temporaire : les données seront effacées à la prochaine mise à jour. Touche ici pour voir comment corriger.</a>{% endif %}{% for c,m in get_flashed_messages(with_categories=true) %}<div class="flash {{ c }}">{{ m }}</div>{% endfor %}{% block c %}{% endblock %}</main>
-{% if not bare and me %}<nav class="tabs"><div>{% for h,i,l in [('/','home','Découverte'),('/communautes','users','Groupes'),('/quiz','game','Quiz'),('/catalogue','compass','Catalogue'),('/profil/'+me.username if me else '/connexion','user','Profil')] %}
+{% if not bare and me %}<nav class="tabs"><div>{% for h,i,l in [('/','home','Découverte'),('/communautes','users','Groupes'),('/quiz','game','Quiz'),('/catalogue','compass','Catalogue'),('/creer','plus','Publier')] %}
 <a href="{{ h }}" class="{{ 'on' if (path==h or (h!='/' and path.startswith(h[:6]))) }} {{ 'mid' if i=='game' }}">{{ ic(i) }}{{ l }}{% if i=='users' and gunread %}<b class="nb">{{ gunread if gunread<100 else '99+' }}</b>{% endif %}</a>{% endfor %}</div></nav>{% endif %}{% if me %}<script>(function(){window.SXA={{ aunread or 0 }};
 function setB(sel,n){document.querySelectorAll(sel).forEach(function(b){if(n>0){b.hidden=false;b.textContent=n>99?'99+':n}else{b.hidden=true}})}
 window.sxBadges=function(d){if(d.a!=null)setB('[data-bd=a]',d.a);if(d.m!=null)setB('[data-bd=m]',d.m);
@@ -3629,14 +3662,14 @@ document.addEventListener('change',function(e){var i=e.target;if(!i.classList||!
  if(f.type==='image/gif'&&f.size<=1500000)return setp(fm,f,'image/gif');fit(f,1280,560000).then(function(b){setp(fm,b,'image/jpeg')},function(x){alert(x.message)})});
 document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('.ppb');if(!b)return;var p=b.closest('form').querySelector('.ppoll');p.hidden=!p.hidden;b.classList.toggle('on',!p.hidden)});
 document.addEventListener('submit',function(e){var fm=e.target;if(!fm.classList||!fm.classList.contains('pform')||!fm._p)return;e.preventDefault();
- var q=new URLSearchParams(),el=fm.elements;q.set('t',(el.body.value||'').trim());['mal_id','m_title','m_img'].forEach(function(n){if(el[n]&&el[n].value)q.set(n,el[n].value)});
+ var q=new URLSearchParams(),el=fm.elements;q.set('t',(el.body.value||'').trim());['mal_id','m_title','m_img','m_kind'].forEach(function(n){if(el[n]&&el[n].value)q.set(n,el[n].value)});
  [].forEach.call(fm.querySelectorAll('[name=opt]'),function(o){if(o.value.trim())q.append('o',o.value.trim())});
  var bt=fm.querySelector('.ptools .btn');bt.disabled=true;bt.textContent='Envoi\u2026';function back(m){bt.disabled=false;bt.textContent='Publier';alert(m)}
  var x=new XMLHttpRequest();x.open('POST','/api/publier?'+q.toString());x.setRequestHeader('Content-Type',fm._p.mime);x.setRequestHeader('X-CSRF',CSRF);
- x.onload=function(){var d={};try{d=JSON.parse(x.responseText)}catch(_){}if(d.ok)location.reload();else back(d.error||'Envoi impossible.')};x.onerror=function(){back('Connexion impossible.')};x.send(fm._p.blob)})})();
+ x.onload=function(){var d={};try{d=JSON.parse(x.responseText)}catch(_){}if(d.ok){if(fm.dataset.next)location.href=fm.dataset.next;else location.reload()}else back(d.error||'Envoi impossible.')};x.onerror=function(){back('Connexion impossible.')};x.send(fm._p.blob)})})();
 </script></body></html>"""
 
-T["ev.html"] = r"""{% macro evcard(e) %}<a class="evc" href="/evenement/{{ e.id }}"><img src="/evt/{{ e.id }}?v={{ e.created|replace('-','')|replace(' ','')|replace(':','') }}" alt="" loading="lazy"><span class="evk">{{ EVT_KINDS.get(e.kind,'') }}</span><span class="evt"><b>{{ e.title }}</b>{% if e.day %}<small>📅 {{ fdate(e.day) }}</small>{% endif %}</span></a>{% endmacro %}"""
+T["ev.html"] = r"""{% macro evcard(e) %}{% set u = '/evt/' ~ e.id ~ '?v=' ~ (e.created|replace('-','')|replace(' ','')|replace(':','')) %}<a class="evc" href="/evenement/{{ e.id }}"><span class="evb" style="--u:url({{ u }})"><img src="{{ u }}" alt="" loading="lazy"></span><span class="evk">{{ EVT_KINDS.get(e.kind,'') }}</span><span class="evt"><b>{{ e.title }}</b>{% if e.day %}<small>📅 {{ fdate(e.day) }}</small>{% endif %}</span></a>{% endmacro %}"""
 
 T["events.html"] = r"""{% extends "base.html" %}{% from "ev.html" import evcard %}{% set back='/' %}{% block c %}<h1 style="font-size:1.4rem">À la une</h1>
 {% if rows %}<div class="evgrid">{% for e in rows %}{{ evcard(e) }}{% endfor %}</div>{% else %}<p class="mut" style="text-align:center;margin-top:30px">Rien à la une pour le moment.</p>{% endif %}
@@ -3699,7 +3732,7 @@ $('dadd').onclick=function(){var t=$('dt').value.trim(),u=$('du').value.trim();i
  var q=new URLSearchParams({t:t,u:u,p:$('dp').value,v:$('dv').value.trim(),s:$('ds').value.trim(),d:$('dd').value.trim()}),b=this;b.disabled=true;
  fetch('/api/admin/telechargement?'+q,{method:'POST',headers:{'Content-Type':'image/jpeg','X-CSRF':csrf},body:blob||'',credentials:'same-origin'}).then(function(r){return r.json().then(function(d){if(!r.ok||!d.ok)throw new Error(d.error||'Envoi impossible ('+r.status+').');location.href='/admin/telechargements'})}).catch(function(e){er(e.message);b.disabled=false})}})()</script>{% endblock %}"""
 
-T["lb.html"] = r"""{% extends "base.html" %}{% set back='/' %}{% block c %}
+T["lb.html"] = r"""{% extends "base.html" %}{% block c %}
 <h1 style="margin:6px 0 2px">🏅 Classement de la semaine</h1><p class="mut" style="margin:0 0 12px">Remis à zéro dans {{ left }} jour{{ 's' if left>1 }} (lundi). Les 3 premiers gagnent +100 / +60 / +30 XP.</p>
 {% if mine %}<div class="card skc"><b>Tu es n°{{ mine.rank }}</b> avec {{ mine.pts }} points. Continue !</div>{% else %}<div class="card skc"><b>Tu n'es pas encore classé.</b> <span class="mut">Joue un quiz, publie, commente ou écris dans un groupe pour gagner des points.</span></div>{% endif %}
 <div class="card" style="padding:4px 14px">{% for i,n,v in board %}<a href="/profil/{{ n }}" class="row" style="align-items:center;padding:10px 0;color:inherit;text-decoration:none;{{ 'border-top:1px solid var(--line)' if not loop.first }}"><b style="width:34px;font-size:1.05rem">{{ ['🥇','🥈','🥉'][loop.index0] if loop.index<=3 else loop.index }}</b>{{ ava(n,34) }}<span class="grow" style="{{ 'font-weight:800' if me and n==me.username }}">{{ n }}</span><b style="color:var(--or2)">{{ v }} pts</b></a>{% else %}<p class="mut" style="text-align:center;padding:16px">Personne n'a encore de points cette semaine. Sois le premier ! 👑</p>{% endfor %}</div>
@@ -3884,31 +3917,17 @@ $('apv').innerHTML='<article class="ann new an-'+esc($('ak').value)+'"><div clas
 
 T["home.html"] = r"""{% extends "base.html" %}{% from "m.html" import post, ptools with context %}{% from "trl.html" import tlist, tplayer with context %}{% from "ev.html" import evcard %}{% from "ann.html" import anncard with context %}{% block c %}
 {% set qas = [('/catalogue?t=planning','calendar','Planning','')] %}
-{% if me %}{% set qas = qas + [('/liste','list','Ma liste',''),('/communautes','users','Groupes',''),('/classement','trophy','Classement',''),('/messages','msg','Messages','m'),('/annonces','megaphone','Annonces','a'),('/carte/' ~ me.username,'card','Ma carte',''),('/quiz','swords','Défier un ami','')] %}{% else %}{% set qas = qas + [('/bandes-annonces','film','Trailers','')] %}{% endif %}
+{% if me %}{% set qas = qas + [('/liste','list','Ma liste',''),('/communautes','users','Groupes',''),('/messages','msg','Messages','m'),('/annonces','megaphone','Annonces','a'),('/carte/' ~ me.username,'card','Ma carte',''),('/quiz','swords','Défier un ami','')] %}{% else %}{% set qas = qas + [('/bandes-annonces','film','Trailers','')] %}{% endif %}
 {% if dlcount %}{% set qas = qas + [('/telechargements','dl','Télécharger','')] %}{% endif %}
 <div id="anns" data-more="{{ ann_more or 0 }}">{% for a in anns %}{{ anncard(a) }}{% endfor %}{% if ann_more %}<a class="annmore" href="/annonces">+ {{ ann_more }} autre{{ 's' if ann_more>1 }} message{{ 's' if ann_more>1 }} ›</a>{% endif %}</div>
-<section class="card hub">
+{% if not me %}<section class="card hub">
 {% if me and rk %}<a class="row" href="/profil/{{ me.username }}">{{ ava(me.username,54) }}<span class="grow"><b class="hn" id="hello" data-n="{{ me.username }}">Salut, {{ me.username }} 👋</b><small class="mut">{{ rk.emoji }} {{ rk.name }} · Niveau {{ rk.lvl }}</small></span>{% if sk %}<span class="chip">🔥 {{ sk.n }}</span>{% endif %}</a>
 <div class="meter"><i style="width:{{ rk.pct }}%"></i></div><small class="mut">{{ rk.xp }} XP · {% if rk.nxt %}encore {{ rk.need }} XP pour devenir {{ rk.nxt }}{% else %}rang maximum atteint 🌟{% endif %}</small>
 {% else %}<div class="hero" style="margin:4px 0 12px">L'univers<em>Otaku</em>autrement.</div><div class="row"><a class="btn grow" href="/inscription">Créer un compte</a><a class="btn g grow" href="/connexion">Se connecter</a></div>{% endif %}
-<nav class="qa" aria-label="Accès rapide" style="grid-template-columns:repeat({{ {1:1,2:2,3:3,4:4,5:5,6:3,7:4,8:4,9:3}.get(qas|length,4) }},1fr)">{% for h,i,l,bd in qas %}<a href="{{ h }}"><span>{{ ic(i,24) }}{% if bd %}{% set bn = munread if bd=='m' else aunread %}<em class="nb2" data-bd="{{ bd }}"{% if not bn %} hidden{% endif %}>{{ bn if bn<100 else '99+' }}</em>{% endif %}</span>{{ l }}</a>{% endfor %}</nav></section>
+<nav class="qa" aria-label="Accès rapide" style="grid-template-columns:repeat({{ {1:1,2:2,3:3,4:4,5:5,6:3,7:4,8:4,9:3}.get(qas|length,4) }},1fr)">{% for h,i,l,bd in qas %}<a href="{{ h }}"><span>{{ ic(i,24) }}{% if bd %}{% set bn = munread if bd=='m' else aunread %}<em class="nb2" data-bd="{{ bd }}"{% if not bn %} hidden{% endif %}>{{ bn if bn<100 else '99+' }}</em>{% endif %}</span>{{ l }}</a>{% endfor %}</nav></section>{% endif %}
+{% if events %}<div class="sh sec" id="s-une" style="margin-top:6px"><h2>À la une</h2><a href="/evenements">Tout voir ›</a></div><div class="evstrip">{% for e in events %}{{ evcard(e) }}{% endfor %}</div>{% endif %}
 
-<nav class="snav" id="snav" aria-label="Sections">{% if events %}<a href="#s-une">À la une</a>{% endif %}<a href="#s-today">Aujourd'hui</a>{% if me %}<a href="#s-nxt">Mes séries</a>{% endif %}<a href="#s-tend">Tendances</a><a href="#s-sais">Saison</a><a href="#s-genres">Genres</a>{% if trailers %}<a href="#s-trl">Trailers</a>{% endif %}<a href="#feed">Communauté</a></nav>
-{% if events %}<div class="sh sec" id="s-une"><h2>À la une</h2><a href="/evenements">Tout voir ›</a></div><div class="evstrip">{% for e in events %}{{ evcard(e) }}{% endfor %}</div>{% endif %}
-
-<div class="sh sec" id="s-today"><h2>Aujourd'hui</h2></div>
-{% if sk %}<div class="grp" id="pushcard" hidden><button type="button" class="it" onclick="sxPush(true)"><span class="ico">{{ ic('bell',19) }}</span><span class="grow">Ne perds plus ta série<small>Reçois un rappel sur ton téléphone</small></span><span class="tag">Activer</span></button></div>
-<div class="card skc{{ ' ok' if sk.done }}" style="margin-top:0"><div class="row"><span class="skf">🔥</span><div class="grow"><b style="font-size:1.05rem">{{ sk.n }} jour{{ 's' if sk.n>1 }} d'affilée</b><small class="mut" style="display:block">{% if sk.done %}Bonus du jour récupéré ✅ Reviens demain pour +{{ sk.bonus }} XP{% elif sk.n %}Ne casse pas ta série ! Jour {{ sk.after }} : +{{ sk.bonus }} XP{% else %}Commence ta série : +{{ sk.bonus }} XP aujourd'hui{% endif %}</small></div></div>
-<div class="skw">{% for w in sk.week %}<i class="{{ 'on' if w.ok }}">{{ w.d }}</i>{% endfor %}</div>
-{% if sk.ms %}<small class="mut" style="display:block;margin-bottom:8px">🎁 Prochain cadeau : {{ sk.ms }} jours (+{{ sk.ms_xp }} XP){% if sk.ms_in %}, encore {{ sk.ms_in }} jour{{ 's' if sk.ms_in>1 }}{% endif %}</small>{% endif %}
-{% if not sk.done %}<form method="post" action="/bonus-du-jour">{{ csrf() }}<button class="btn w">🎁 Récupérer +{{ sk.bonus }} XP</button></form>{% endif %}</div>{% endif %}
-<div class="grp">
-<a class="it" href="/quiz"><span class="ico">{{ ic('game',19) }}</span><span class="grow">Tournoi du jour<small>{{ dc.n }} joueur{{ 's' if dc.n>1 }} · <span class="eta" data-eta="{{ eta }}">fin dans {{ eta//3600 }} h {{ eta%3600//60 }} min</span></small>{% if dc.top %}<small class="pod">{% for t in dc.top %}<span>{{ ['🥇','🥈','🥉'][loop.index0] }} {{ t.u }} {{ t.g }}/10</span>{% endfor %}</small>{% else %}<small>Personne n'a encore joué : prends la 1re place 👑</small>{% endif %}<small class="hot">{% if dc.mine %}Tu as fait {{ dc.mine.g }}/10{% else %}Podium : +30 / +20 / +10 XP{% endif %}{% if dc.champ %} · 👑 hier : {{ dc.champ.u }}{% endif %}</small></span><span class="tag">{% if dc.mine %}n°{{ dc.mine.rank }}{% else %}Jouer{% endif %}</span>{{ ic('chev',18) }}</a>
-{% if me %}<a class="it" href="/communautes"><span class="ico">{{ ic('target',19) }}</span><span class="grow">Rituel du jour<small>{{ rit }}</small><small class="hot">Réponds dans un de tes groupes</small></span><span class="tag">+10 XP</span>{{ ic('chev',18) }}</a>
-<a class="it" href="/classement"><span class="ico">{{ ic('trophy',19) }}</span><span class="grow">Classement de la semaine{% if wk %}<small class="pod">{% for i,n,v in wk %}<span>{{ ['🥇','🥈','🥉'][loop.index0] }} {{ n }} {{ v }} pts</span>{% endfor %}</small>{% endif %}<small>Remis à zéro chaque lundi · podium +100 / +60 / +30 XP</small></span>{{ ic('chev',18) }}</a>{% endif %}
-</div>
-{% if ms %}<details class="grp acc ms"><summary class="it"><span class="ico">{{ ic('target',19) }}</span><span class="grow">Missions de bienvenue · {{ ms.done }}/{{ ms.total }}<small>Badge 🎖️ Recrue + 50 XP · encore {{ ms.left }} jour{{ 's' if ms.left>1 }}</small><span class="meter"><i style="width:{{ (100*ms.done/ms.total)|int }}%"></i></span></span>{{ ic('chev',18) }}</summary>
-<div class="mlist">{% for m in ms['items'] %}<a href="{{ m.link }}" class="mrow{{ ' ok' if m.ok }}"><span class="ck">{% if m.ok %}{{ ic('check',14) }}{% endif %}</span><span class="grow">{{ m.title }}</span><b>+{{ m.xp }} XP</b></a>{% endfor %}</div></details>{% endif %}
+<nav class="snav" id="snav" aria-label="Sections">{% if events %}<a href="#s-une">À la une</a>{% endif %}{% if me %}<a href="#s-nxt">Mes séries</a>{% endif %}<a href="#s-tend">Tendances</a><a href="#s-sais">Saison</a><a href="#s-genres">Genres</a>{% if trailers %}<a href="#s-trl">Trailers</a>{% endif %}<a href="#feed">Communauté</a></nav>
 
 <script>function skP(n){var h='';for(var i=0;i<n;i++)h+='<div class="pst"><div class="sk" style="aspect-ratio:2/3;border-radius:16px"></div><div class="sk" style="height:10px;margin-top:9px;width:78%"></div></div>';return h}
 function pst(m,i,rk){return'<a class="pst'+(rk?' rk':'')+'" href="/serie/'+m.id+'"><span class="pi"><img src="'+esc(m.img)+'" alt="" loading="lazy">'+(m.score?'<em class="sc">★ '+m.score+'</em>':'')+(rk?'<b class="rn r'+(i<3?i+1:0)+'">'+(i+1)+'</b>':'')+'</span><span class="pt">'+esc(m.title)+'</span></a>'}</script>
@@ -3928,12 +3947,11 @@ L('saison').then(function(l){$('airing').innerHTML=l.slice(0,14).map(function(m)
 
 <div class="sh sec" id="feed"><h2>Communauté</h2>{% if me %}<a href="/communautes">Mes groupes ›</a>{% endif %}</div>
 {% if me %}<div class="seg"><a class="{{ 'on' if tab!='suivis' }}" href="/#feed">Pour toi</a><a class="{{ 'on' if tab=='suivis' }}" href="/?t=suivis#feed">Mes séries</a></div>
-<form method="post" action="/publier" class="card pform" style="margin-top:0">{{ csrf() }}<div class="row">{{ ava(me.username,36) }}<textarea name="body" maxlength="1000" placeholder="Partage ton avis, un spoiler (avec précaution)…" style="min-height:52px"></textarea></div>{{ ptools() }}</form>
+
 {% else %}<div class="card emp"><b>Rejoins la communauté</b><p class="mut">Crée un compte pour publier, jouer et rejoindre des groupes.</p><a class="btn s" href="/inscription">Créer un compte</a></div>{% endif %}
 {% for p in posts %}{{ post(p) }}{% else %}<p class="mut" style="text-align:center;margin-top:24px">{{ 'Ajoute des séries en favori pour voir leurs discussions.' if tab=='suivis' else 'Aucun post pour le moment. Sois le premier !' }}</p>{% endfor %}
 <script>(function(){
 var h=new Date().getHours(),e=document.getElementById('hello');if(e)e.textContent=(h>=5&&h<18?'Bonjour':'Bonsoir')+', '+e.dataset.n+' 👋';
-var t0=Date.now();function tick(){document.querySelectorAll('.eta').forEach(function(x){var r=Math.max(0,+x.dataset.eta-Math.floor((Date.now()-t0)/1000)),H=Math.floor(r/3600),M=Math.floor(r%3600/60);x.textContent=r<=0?'nouveau tournoi imminent':'fin dans '+H+' h '+(M<10?'0':'')+M+' min'})}tick();setInterval(tick,20000);
 var hid=0;document.addEventListener('visibilitychange',function(){if(document.hidden){hid=Date.now();return}var ta=document.querySelector('.pform textarea');if(hid&&Date.now()-hid>300000&&!(ta&&ta.value))location.reload()});
 var el=document.createElement('div');el.className='ptr';el.textContent='↓';document.body.appendChild(el);var x0=0,y0=null,pull=0;
 addEventListener('touchstart',function(ev){var t=ev.target;y0=(window.scrollY<=0&&ev.touches.length==1&&!(t.closest&&t.closest('.drw,textarea,input,.stories,.rail,.evstrip,.tstrip,.snav,.gch,.sheet')))?ev.touches[0].clientY:null;x0=ev.touches[0].clientX;pull=0},{passive:true});
@@ -3947,6 +3965,32 @@ var cur=-1,tk=0;function spy(){tk=0;var y=(hd?hd.offsetHeight:58)+nav.offsetHeig
 if(innerHeight+scrollY>=document.documentElement.scrollHeight-4)k=sc.length-1;
 if(k!==cur){cur=k;ln.forEach(function(a,i){a.classList.toggle('on',i==k)});var a=ln[k];if(a)nav.scrollTo({left:Math.max(0,a.offsetLeft-16),behavior:'smooth'})}}
 addEventListener('scroll',function(){if(!tk)tk=requestAnimationFrame(spy)},{passive:true});spy()})()</script>
+{% endblock %}"""
+
+T["create.html"] = r"""{% extends "base.html" %}{% from "m.html" import ptools with context %}{% block c %}
+<style>.lrow{display:flex;gap:10px;align-items:center;width:100%;text-align:left;padding:6px;margin-top:6px;border:1px solid var(--line);border-radius:14px;background:var(--card2);color:inherit;font-family:inherit;cursor:pointer}.lrow img,.lsel img{width:38px;height:54px;object-fit:cover;border-radius:8px;flex:none}.lrow span,.lsel span{display:flex;flex-direction:column;min-width:0;flex:1}.lrow b,.lsel b{font-size:.9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.lrow small,.lsel small{color:var(--mut)}.lsel{display:flex;gap:10px;align-items:center;margin-top:10px;padding:6px 8px;border:1px solid var(--or);border-radius:14px;background:var(--card2)}.lsel button{width:30px;height:30px;padding:0;border-radius:50%;border:0;background:var(--card);color:var(--text);cursor:pointer;flex:none}.lsel[hidden],#lbox[hidden]{display:none}</style>
+<h1 style="margin:6px 0 2px">Publier</h1><p class="mut" style="margin:0 0 12px">Partage ton avis, une photo ou un sondage avec la communauté. +15 XP par publication.</p>
+<div class="row cpick" style="flex-wrap:wrap;gap:8px;margin-bottom:10px">{% for e,l,p in [('💬','Mon avis','💬 Mon avis : '),('⚠️','Spoiler','⚠️ SPOILER : '),('❓','Question','❓ '),('🔥','Reco','🔥 Je recommande : '),('🧠','Théorie','🧠 Théorie : ')] %}<button type="button" class="chip" data-p="{{ p }}" style="cursor:pointer;border:0;font:inherit">{{ e }} {{ l }}</button>{% endfor %}</div>
+<form method="post" action="/publier" class="card pform" data-next="/#feed" style="margin-top:0">{{ csrf() }}<input type="hidden" name="next" value="feed"><div class="row">{{ ava(me.username,40) }}<textarea name="body" id="cb" maxlength="1000" placeholder="Partage ton avis, un spoiler (avec précaution)…" style="min-height:140px"></textarea></div>
+<div id="lnk"><input type="hidden" name="mal_id" id="lid"><input type="hidden" name="m_title" id="lt"><input type="hidden" name="m_img" id="li"><input type="hidden" name="m_kind" id="lk" value="anime">
+<div class="lsel" id="lsel" hidden></div>
+<div id="lbox"><input id="lq" placeholder="🔗 Lier à un animé ou un manga (facultatif)" autocomplete="off" style="margin:10px 0 0"><div class="pills" id="lpills" style="margin:8px 0 0"><button type="button" class="pill on" data-k="anime" style="border:0;cursor:pointer;font-family:inherit">Animé</button><button type="button" class="pill" data-k="manga" style="border:0;cursor:pointer;font-family:inherit">Manga</button></div><div id="lres"></div></div></div>
+{{ ptools() }}</form>
+<div class="card"><b>Astuces</b><ul class="mut" style="margin:8px 0 0;padding-left:18px;line-height:1.7"><li>📸 Touche l'icône photo pour ajouter une image</li><li>📊 Touche l'icône sondage : 2 choix = duel « versus »</li><li>🔗 Lie ton post à une série : il apparaît aussi sur sa fiche</li><li>⚠️ Mets « SPOILER » au début si tu racontes l'histoire</li></ul></div>
+<script>(function(){var t=document.getElementById('cb'),re=/^(💬 Mon avis : |⚠️ SPOILER : |❓ |🔥 Je recommande : |🧠 Théorie : )/;document.querySelectorAll('.cpick .chip').forEach(function(b){b.onclick=function(){t.value=b.dataset.p+t.value.replace(re,'');t.focus();t.setSelectionRange(t.value.length,t.value.length)}})})()</script>
+<script>(function(){var q=$('lq'),res=$('lres'),sel=$('lsel'),box=$('lbox'),k='anime',tm,tk=0,cur=[];
+function sm(v){return AL('query($q:String){Page(page:1,perPage:12){media(type:MANGA,isAdult:false,search:$q,sort:SEARCH_MATCH){'+MF+'}}}',{q:v}).then(function(d){return fin(d.Page.media)}).catch(function(){return get(JK+'/manga?q='+encodeURIComponent(v)+'&limit=12&sfw=true&order_by=popularity').then(function(d){return uniq((d.data||[]).map(nm))})})}
+function row(m,i){return'<button type="button" class="lrow" data-i="'+i+'">'+(m.img?'<img src="'+esc(m.img)+'" alt="" loading="lazy">':'')+'<span><b>'+esc(m.title)+'</b><small>'+esc([m.type,m.year].filter(Boolean).join(' · '))+'</small></span></button>'}
+function run(){var v=q.value.trim(),n=++tk;if(v.length<2){res.innerHTML='';return}res.innerHTML='<small class="mut" style="display:block;margin-top:8px">Recherche…</small>';
+ (k=='manga'?sm(v):L('search',{q:v})).then(function(l){if(n!=tk)return;cur=l.slice(0,6);res.innerHTML=cur.length?cur.map(row).join(''):'<small class="mut" style="display:block;margin-top:8px">Aucun résultat.</small>'}).catch(function(){if(n==tk)res.innerHTML='<small class="mut" style="display:block;margin-top:8px">Sources injoignables, réessaie dans un instant.</small>'})}
+q.oninput=function(){clearTimeout(tm);tm=setTimeout(run,450)};
+q.onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();clearTimeout(tm);run()}};
+[].forEach.call(document.querySelectorAll('#lpills button'),function(b){b.onclick=function(){k=b.dataset.k;[].forEach.call(document.querySelectorAll('#lpills button'),function(x){x.classList.toggle('on',x===b)});run()}});
+res.onclick=function(e){var b=e.target.closest('.lrow');if(!b)return;var m=cur[+b.dataset.i];if(!m)return;
+ $('lid').value=m.id;$('lt').value=m.title;$('li').value=m.img||'';$('lk').value=k;
+ sel.innerHTML=(m.img?'<img src="'+esc(m.img)+'" alt="">':'')+'<span><b>'+esc(m.title)+'</b><small>'+(k=='manga'?'Manga':'Animé')+'</small></span><button type="button" aria-label="Retirer">\u2715</button>';sel.hidden=false;box.hidden=true;res.innerHTML='';
+ sel.querySelector('button').onclick=function(){$('lid').value='';$('lt').value='';$('li').value='';sel.hidden=true;sel.innerHTML='';box.hidden=false;q.value='';q.focus()}};
+})()</script>
 {% endblock %}"""
 
 T["search.html"] = r"""{% extends "base.html" %}{% block c %}
@@ -3988,7 +4032,7 @@ T["media.html"] = r"""{% extends "base.html" %}{% from "m.html" import post, pto
 <a id="tr" class="btn g w" target="_blank" rel="noopener" style="margin-top:8px" hidden>Bande-annonce</a>
 <div class="card"><p id="syn" style="margin:0;white-space:pre-wrap" class="mut">Chargement…</p></div>
 <div id="chars"></div>
-<h2>En parler</h2>{% if me %}<form method="post" action="/publier" class="card pform">{{ csrf() }}<input type="hidden" name="mal_id" value="{{ mid }}"><input type="hidden" name="m_title" id="pt"><input type="hidden" name="m_img" id="pi"><textarea name="body" placeholder="Ton avis…" maxlength="1000"></textarea>{{ ptools() }}</form>{% endif %}
+<h2>En parler</h2>{% if me %}<form method="post" action="/publier" class="card pform">{{ csrf() }}<input type="hidden" name="mal_id" value="{{ mid }}"><input type="hidden" name="m_title" id="pt"><input type="hidden" name="m_img" id="pi"><input type="hidden" name="m_kind" value="{{ k }}"><textarea name="body" placeholder="Ton avis…" maxlength="1000"></textarea>{{ ptools() }}</form>{% endif %}
 {% for p in posts %}{{ post(p) }}{% endfor %}
 <script>M({{ mid }},'{{ k }}').then(function(m){document.title=m.title+' · SenpaiX';
 $('info').innerHTML='<div class="row" style="align-items:flex-start"><img src="'+esc(m.img)+'" alt="" style="width:130px;border-radius:16px"><div class="grow"><h1 style="font-size:1.2rem">'+esc(m.title)+'</h1><p class="mut" style="margin:0 0 8px">'+esc(m.type||'')+' · '+(m.year||'?')+' · '+(m.eps||'?')+' ép./ch.<br>'+esc(m.genres)+(m.studio?'<br>'+esc(m.studio):'')+'</p>'+(m.score?'<b style="color:var(--or2)">★ '+m.score+'</b>':'')+'</div></div>';
@@ -4181,6 +4225,28 @@ T["profile.html"] = r"""{% extends "base.html" %}{% from "m.html" import post wi
 {% if me and not own %}<div class="pact"><a class="btn grow" href="/messages/{{ u.username }}">{{ ic('msg',16) }} Message</a><a class="btn grow" href="/quiz?defier={{ u.username }}" style="background:linear-gradient(100deg,var(--or2),var(--or))">⚔️ Défier</a><details class="more"><summary class="mbtn" aria-label="Plus d'actions">{{ ic('dots',22) }}</summary><div class="mn"><form method="post" action="/signaler/user/{{ u.id }}">{{ csrf() }}<input type="hidden" name="reason" value="Contenu inapproprié"><button>{{ ic('shield',18) }} Signaler</button></form><form method="post" action="/bloquer/{{ u.username }}">{{ csrf() }}<button>{{ ic('lock',18) }} Bloquer {{ u.username }}</button></form></div></details></div>
 {% elif own %}<div class="pact"><a class="btn grow" href="/profil/modifier">✨ Personnaliser</a><a class="btn g grow" href="/parametres">{{ ic('sliders',16) }} Paramètres</a></div>{% endif %}</div></div>
 {% if locked %}<div class="card" style="text-align:center;margin-top:14px">{{ ic('lock') }} Ce profil est privé.</div>{% else %}
+{% if own %}{% set qas = [('/catalogue?t=planning','calendar','Planning',''),('/liste','list','Ma liste',''),('/communautes','users','Groupes',''),('/messages','msg','Messages','m'),('/annonces','megaphone','Annonces','a'),('/carte/' ~ me.username,'card','Ma carte',''),('/quiz','swords','Défier un ami','')] %}{% if dlcount %}{% set qas = qas + [('/telechargements','dl','Télécharger','')] %}{% endif %}
+<section class="card hub" style="margin-top:14px"><div class="row"><span class="grow"><b class="hn">Mon tableau de bord</b><small class="mut">{{ rk.emoji }} {{ rk.name }} · Niveau {{ rk.lvl }}</small></span>{% if tp %}<span class="chip">🔥 {{ tp.sk.n }}</span>{% endif %}</div>
+<div class="meter"><i style="width:{{ rk.pct }}%"></i></div><small class="mut">{{ rk.xp }} XP · {% if rk.nxt %}encore {{ rk.need }} XP pour devenir {{ rk.nxt }}{% else %}rang maximum atteint 🌟{% endif %}</small>
+<nav class="qa" aria-label="Accès rapide" style="grid-template-columns:repeat({{ {1:1,2:2,3:3,4:4,5:5,6:3,7:4,8:4,9:3}.get(qas|length,4) }},1fr)">{% for h,i,l,bd in qas %}<a href="{{ h }}"><span>{{ ic(i,24) }}{% if bd %}{% set bn = munread if bd=='m' else aunread %}<em class="nb2" data-bd="{{ bd }}"{% if not bn %} hidden{% endif %}>{{ bn if bn<100 else '99+' }}</em>{% endif %}</span>{{ l }}</a>{% endfor %}</nav></section>{% endif %}
+{% if own and tp %}{% set sk = tp.sk %}{% set dc = tp.dc %}{% set ms = tp.ms %}{% set nd = (1 if sk.done else 0) + (1 if dc.mine else 0) + (1 if tp.rit_done else 0) %}
+<div class="sh"><h2>🔥 Ma série</h2></div>
+<div class="grp" id="pushcard" hidden><button type="button" class="it" onclick="sxPush(true)"><span class="ico">{{ ic('bell',19) }}</span><span class="grow">Ne perds plus ta série<small>Reçois un rappel sur ton téléphone</small></span><span class="tag">Activer</span></button></div>
+<div class="card skc{{ ' ok' if sk.done }}" id="serie" style="margin-top:0"><div class="row"><span class="skf">🔥</span><div class="grow"><b style="font-size:1.05rem">{{ sk.n }} jour{{ 's' if sk.n>1 }} d'affilée</b><small class="mut" style="display:block">{% if sk.done %}Bonus du jour récupéré ✅ Reviens demain pour +{{ sk.bonus }} XP{% elif sk.n %}Ne casse pas ta série ! Jour {{ sk.after }} : +{{ sk.bonus }} XP{% else %}Commence ta série : +{{ sk.bonus }} XP aujourd'hui{% endif %}</small></div></div>
+<div class="skw">{% for w in sk.week %}<i class="{{ 'on' if w.ok }}">{{ w.d }}</i>{% endfor %}</div>
+{% if sk.ms %}<small class="mut" style="display:block;margin-bottom:8px">🎁 Prochain cadeau : {{ sk.ms }} jours (+{{ sk.ms_xp }} XP){% if sk.ms_in %}, encore {{ sk.ms_in }} jour{{ 's' if sk.ms_in>1 }}{% endif %}</small>{% endif %}
+{% if not sk.done %}<form method="post" action="/bonus-du-jour">{{ csrf() }}<button class="btn w">🎁 Récupérer +{{ sk.bonus }} XP</button></form>{% endif %}</div>
+<div class="sh"><h2>✅ Tâches du jour <span class="mut" style="font-weight:600">· {{ nd }}/3</span></h2></div>
+<div class="grp">
+<a class="it" href="#serie" style="{{ 'opacity:.65' if sk.done }}"><span class="ico">{{ ic('check' if sk.done else 'sun',19) }}</span><span class="grow">Bonus du jour<small>{% if sk.done %}Récupéré · reviens demain{% else %}Récupère-le pour garder ta série{% endif %}</small></span><span class="tag">{% if sk.done %}✓ Fait{% else %}+{{ sk.bonus }} XP{% endif %}</span></a>
+<a class="it" href="/quiz" style="{{ 'opacity:.65' if dc.mine }}"><span class="ico">{{ ic('game',19) }}</span><span class="grow">Tournoi du jour<small>{{ dc.n }} joueur{{ 's' if dc.n>1 }} · <span class="eta" data-eta="{{ tp.eta }}">fin dans {{ tp.eta//3600 }} h {{ tp.eta%3600//60 }} min</span></small>{% if dc.top %}<small class="pod">{% for t in dc.top %}<span>{{ ['🥇','🥈','🥉'][loop.index0] }} {{ t.u }} {{ t.g }}/10</span>{% endfor %}</small>{% else %}<small>Personne n'a encore joué : prends la 1re place 👑</small>{% endif %}<small class="hot">{% if dc.mine %}Tu as fait {{ dc.mine.g }}/10{% else %}Podium : +30 / +20 / +10 XP{% endif %}{% if dc.champ %} · 👑 hier : {{ dc.champ.u }}{% endif %}</small></span><span class="tag">{% if dc.mine %}n°{{ dc.mine.rank }}{% else %}Jouer{% endif %}</span>{{ ic('chev',18) }}</a>
+<a class="it" href="/communautes" style="{{ 'opacity:.65' if tp.rit_done }}"><span class="ico">{{ ic('target',19) }}</span><span class="grow">Rituel du jour<small>{{ tp.rit }}</small><small class="hot">{% if tp.rit_done %}Déjà répondu aujourd'hui{% else %}Réponds dans un de tes groupes{% endif %}</small></span><span class="tag">{% if tp.rit_done %}✓ Fait{% else %}+10 XP{% endif %}</span>{{ ic('chev',18) }}</a>
+{% if ms %}<details class="acc ms"><summary class="it"><span class="ico">{{ ic('target',19) }}</span><span class="grow">Missions de bienvenue · {{ ms.done }}/{{ ms.total }}<small>Badge 🎖️ Recrue + 50 XP · encore {{ ms.left }} jour{{ 's' if ms.left>1 }}</small><span class="meter"><i style="width:{{ (100*ms.done/ms.total)|int }}%"></i></span></span>{{ ic('chev',18) }}</summary>
+<div class="mlist">{% for m in ms['items'] %}<a href="{{ m.link }}" class="mrow{{ ' ok' if m.ok }}"><span class="ck">{% if m.ok %}{{ ic('check',14) }}{% endif %}</span><span class="grow">{{ m.title }}</span><b>+{{ m.xp }} XP</b></a>{% endfor %}</div></details>{% endif %}
+</div>
+<div class="sh"><h2>🏅 Classement</h2><a href="/classement">Tout voir ›</a></div>
+<div class="grp"><a class="it" href="/classement"><span class="ico">{{ ic('trophy',19) }}</span><span class="grow">Classement de la semaine{% if tp.wk %}<small class="pod">{% for i,n,v in tp.wk %}<span>{{ ['🥇','🥈','🥉'][loop.index0] }} {{ n }} {{ v }} pts</span>{% endfor %}</small>{% endif %}<small>{% if tp.rank %}Tu es n°{{ tp.rank.rank }} avec {{ tp.rank.pts }} pts{% else %}Tu n'es pas encore dans le top 30{% endif %} · remis à zéro chaque lundi</small></span>{{ ic('chev',18) }}</a></div>
+{% endif %}
 <div class="sh"><h2>Progression</h2></div>
 {{ rkcard(rk) }}
 <div class="grp"><a class="it" href="/carte/{{ u.username }}"><span class="ico">{{ ic('card',19) }}</span><span class="grow">{{ 'Ma carte Otaku' if own else 'Sa carte Otaku' }}<small>Une carte à partager</small></span>{{ ic('chev',18) }}</a>
@@ -4190,7 +4256,8 @@ T["profile.html"] = r"""{% extends "base.html" %}{% from "m.html" import post wi
 <div class="sh"><h2>Badges <span class="mut" style="font-weight:600">· {{ badges|selectattr('ok')|list|length }}/{{ badges|length }}</span></h2></div><div class="badges">{% for b in badges %}<div class="bdg{{ ' on' if b.ok }}" title="{{ b.d }}"><span>{{ b.e }}</span><small>{{ b.n }}</small></div>{% endfor %}</div>
 {% if favs %}<div class="sh"><h2>Séries favorites</h2>{% if own %}<a href="/liste">Ma liste ›</a>{% endif %}</div><div class="stories">{% for f in favs %}<a class="st" style="width:90px" href="/serie/{{ f.mal_id }}{{ '?k=manga' if f.kind=='manga' }}"><img src="{{ f.img }}" alt="" style="border-radius:14px;aspect-ratio:2/3;border:0"><span>{{ f.title }}</span></a>{% endfor %}</div>{% endif %}
 <div class="sh"><h2>Publications</h2></div>{% for p in posts %}{{ post(p) }}{% else %}<p class="mut" style="text-align:center">Rien pour l'instant.</p>{% endfor %}{% endif %}
-<script>fx($('fxb'),$('fxb').dataset.fx)</script>{% endblock %}"""
+<script>fx($('fxb'),$('fxb').dataset.fx)</script>
+{% if own and tp %}<script>(function(){var t0=Date.now();function tick(){document.querySelectorAll('.eta').forEach(function(x){var r=Math.max(0,+x.dataset.eta-Math.floor((Date.now()-t0)/1000)),H=Math.floor(r/3600),M=Math.floor(r%3600/60);x.textContent=r<=0?'nouveau tournoi imminent':'fin dans '+H+' h '+(M<10?'0':'')+M+' min'})}tick();setInterval(tick,20000)})()</script>{% endif %}{% endblock %}"""
 
 T["inbox.html"] = r"""{% extends "base.html" %}{% block c %}<h1>Messages</h1><div class="grp">{% for r in rows %}<a class="it" href="/messages/{{ r.username }}">{{ ava(r.username,40) }}<span class="grow"><b>{{ r.username }}</b><small>{{ r.body[:50] }} · {{ ago(r.created) }}</small></span>{% if r.un %}<b style="color:var(--or)">{{ r.un }}</b>{% endif %}</a>
 {% else %}<div class="it mut">Aucune conversation. Va sur un profil pour écrire.</div>{% endfor %}</div>{% endblock %}"""
